@@ -41,22 +41,44 @@ function assertConfirmed(config: AppConfig, confirm: boolean, kind: string): voi
 
 export const RAW_PATH_PREFIXES = ['/wiki/api/v2/', '/wiki/rest/api/'] as const;
 
-export function assertSafeRawPath(path: string): void {
-  if (
-    !path.startsWith('/') ||
-    path.length > 500 ||
-    path.includes('://') ||
-    path.includes('\\') ||
-    path.includes('..') ||
-    path.includes('//') ||
-    path.includes('?') ||
-    path.includes('#') ||
-    Array.from(path).some((character) => {
+function hasUnsafeShape(value: string): boolean {
+  return (
+    !value.startsWith('/') ||
+    value.length > 500 ||
+    value.includes('://') ||
+    value.includes('\\') ||
+    value.includes('..') ||
+    value.includes('//') ||
+    value.includes('?') ||
+    value.includes('#') ||
+    Array.from(value).some((character) => {
       const code = character.charCodeAt(0);
       return code < 32 || code === 127;
     }) ||
-    !RAW_PATH_PREFIXES.some((prefix) => path.startsWith(prefix))
-  ) {
+    !RAW_PATH_PREFIXES.some((prefix) => value.startsWith(prefix))
+  );
+}
+
+// Percent-encoded separators and dot segments must not survive whatever decoding the
+// Confluence gateway applies, so the same checks also run against the fully decoded path.
+function fullyDecoded(path: string): string | undefined {
+  let current = path;
+  for (let round = 0; round < 3; round += 1) {
+    let next: string;
+    try {
+      next = decodeURIComponent(current);
+    } catch {
+      return undefined;
+    }
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
+}
+
+export function assertSafeRawPath(path: string): void {
+  const decoded = fullyDecoded(path);
+  if (decoded === undefined || hasUnsafeShape(path) || hasUnsafeShape(decoded)) {
     throw new Error(
       'Raw path must be a relative Confluence path under /wiki/api/v2/ or /wiki/rest/api/',
     );

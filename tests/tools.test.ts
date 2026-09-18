@@ -9,6 +9,7 @@ describe('raw path safety', () => {
     expect(() => assertSafeRawPath('https://example.atlassian.net/wiki/api/v2/pages')).toThrow();
     expect(() => assertSafeRawPath('/wiki/api/v2/../admin-key')).toThrow();
     expect(() => assertSafeRawPath('/wiki/api/v2/pages?cursor=secret')).toThrow();
+    expect(() => assertSafeRawPath('/wiki/api/v2/%2e%2e/%2e%2e/rest/api/3/myself')).toThrow();
   });
 });
 

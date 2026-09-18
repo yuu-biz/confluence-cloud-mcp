@@ -132,7 +132,7 @@ export class ConfluenceClient {
       try {
         response = await this.fetchImpl(url, { ...init, signal: controller.signal });
       } catch (error) {
-        if (attempt < this.maxRetries) {
+        if (attempt < this.maxRetries && method !== 'POST') {
           await this.sleep(Math.min(250 * 2 ** attempt, 4_000));
           continue;
         }
@@ -144,7 +144,12 @@ export class ConfluenceClient {
         clearTimeout(timeout);
       }
 
-      if ((response.status === 429 || response.status >= 500) && attempt < this.maxRetries) {
+      // 429 means the request was rejected before any change, so it is safe to replay for any
+      // method. A 5xx may have been applied already, so POST is never replayed.
+      if (
+        (response.status === 429 || (response.status >= 500 && method !== 'POST')) &&
+        attempt < this.maxRetries
+      ) {
         await this.sleep(retryDelayMs(response, attempt));
         continue;
       }
@@ -190,7 +195,24 @@ export class ConfluenceClient {
       Authorization: this.authHeader,
       'X-Atlassian-Token': 'no-check',
     });
-    const response = await this.fetchImpl(url, { method: 'POST', headers, body: form });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'POST',
+        headers,
+        body: form,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new Error(`Confluence upload timed out after ${this.timeoutMs} ms`);
+      }
+      throw new Error('Confluence upload failed before receiving a response');
+    } finally {
+      clearTimeout(timeout);
+    }
     const responseBody = await readBody(response);
     if (!response.ok) {
       const requestId =
