@@ -470,7 +470,7 @@ export function registerConfluenceTools(
     'confluence_get_ancestors',
     {
       description:
-        'Get the ancestor chain for a page or folder so an LLM can understand its location in the hierarchy.',
+        'Primitive: get the ancestor chain for a page or folder. When the surrounding page context is also needed, prefer confluence_get_page_context.',
       inputSchema: z.object({
         content_id: z.string().min(1),
         content_type: z.enum(['page', 'folder']).default('page'),
@@ -491,7 +491,7 @@ export function registerConfluenceTools(
     'confluence_list_attachments',
     {
       description:
-        'List attachments for a page with optional filename, media type, status, and cursor filters.',
+        'Primitive: list attachments for a page with optional filename, media type, status, and cursor filters. For attachments together with the page body and comments, prefer confluence_get_page_context.',
       inputSchema: z.object({
         page_id: z.string().min(1),
         filename: z.string().optional(),
@@ -617,7 +617,7 @@ export function registerConfluenceTools(
     'confluence_get_comment',
     {
       description:
-        'Get one footer or inline comment by ID, including its body and optional version metadata.',
+        'Primitive: get one footer or inline comment by ID. For the comment plus its bounded reply tree, prefer confluence_get_comment_thread.',
       inputSchema: z.object({
         comment_id: z.string().min(1),
         comment_type: z.enum(['footer', 'inline']).default('footer'),

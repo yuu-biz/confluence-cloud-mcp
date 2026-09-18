@@ -23,6 +23,9 @@ const DEFAULT_SEARCH_FETCH = 5;
 const MAX_SEARCH_FETCH = 20;
 const DEFAULT_FETCH_CONCURRENCY = 3;
 const MAX_FETCH_CONCURRENCY = 5;
+const MAX_PAGINATION_PAGES = 20;
+const THREAD_CHILD_CONCURRENCY = 4;
+const MAX_THREAD_API_CALLS = 60;
 
 function asRecord(value: unknown): JsonRecord | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -155,6 +158,7 @@ export async function collectCursorPages<T>(
   let nextCursor: string | undefined;
 
   while (items.length < maxItems) {
+    if (pagesFetched >= MAX_PAGINATION_PAGES) break;
     try {
       const response = await request(cursor, Math.min(250, maxItems - items.length));
       pagesFetched += 1;
@@ -173,7 +177,7 @@ export async function collectCursorPages<T>(
     }
   }
 
-  const truncated = items.length >= maxItems && Boolean(nextCursor);
+  const truncated = Boolean(nextCursor);
   return {
     items,
     pagesFetched,
@@ -502,23 +506,56 @@ function extractHomepageId(value: unknown): string | undefined {
   return stringValue(record?.homepageId) ?? stringValue(homepage?.id);
 }
 
+// A space key is what people quote, so the numeric v2 space id is resolved here instead of
+// costing the caller a separate confluence_list_spaces round trip.
+async function resolveSpaceId(
+  client: ConfluenceClient,
+  spaceKey: string,
+): Promise<{ spaceId?: string; error?: string }> {
+  try {
+    const response = await client.requestJson<unknown>('GET', '/wiki/api/v2/spaces', {
+      keys: [spaceKey],
+      limit: 1,
+    });
+    const spaceId = stringValue(asRecord(resultItems<unknown>(response.data)[0])?.id);
+    return spaceId ? { spaceId } : { error: `No space found for key ${spaceKey}` };
+  } catch (error) {
+    return { error: publicErrorMessage(error) };
+  }
+}
+
 export async function getSpaceOverview(
   client: ConfluenceClient,
   args: {
-    spaceId: string;
+    spaceId?: string;
+    spaceKey?: string;
     rootId?: string;
     rootType: 'page' | 'folder';
     depth: number;
     maxItems: number;
   },
 ): Promise<JsonRecord> {
+  let spaceId = args.spaceId;
+  if (!spaceId && args.spaceKey) {
+    const resolved = await resolveSpaceId(client, args.spaceKey);
+    if (!resolved.spaceId) {
+      return {
+        space: { name: 'space', ok: false, error: resolved.error },
+        tree: undefined,
+        status: { partial: true, errors: [resolved.error] },
+      };
+    }
+    spaceId = resolved.spaceId;
+  }
+  if (!spaceId) throw new Error('Provide space_id or space_key');
+  const resolvedSpaceId = spaceId;
   const spaceResult = await optionalCall('space', () =>
     client
-      .requestJson<unknown>('GET', `/wiki/api/v2/spaces/${encodeURIComponent(args.spaceId)}`)
+      .requestJson<unknown>('GET', `/wiki/api/v2/spaces/${encodeURIComponent(resolvedSpaceId)}`)
       .then((response) => response.data),
   );
-  const spaceId = spaceResult.ok ? extractHomepageId(spaceResult.data) : undefined;
-  const rootId = args.rootId ?? spaceId;
+  const homepageId = spaceResult.ok ? extractHomepageId(spaceResult.data) : undefined;
+  const rootId = args.rootId ?? homepageId;
   if (!rootId) {
     return {
       space: spaceResult,
@@ -537,7 +574,8 @@ export async function getSpaceOverview(
   });
   return {
     space: spaceResult,
-    homepageId: spaceId,
+    spaceId: resolvedSpaceId,
+    homepageId,
     tree,
     status: { partial: Boolean(!spaceResult.ok || asRecord(tree.status)?.partial === true) },
   };
@@ -566,38 +604,50 @@ export async function getCommentThread(
   apiCalls += 1;
   itemCount = 1;
 
-  const visit = async (comment: JsonRecord, depth: number): Promise<void> => {
-    if (depth >= args.maxDepth || itemCount >= args.maxItems) {
-      truncated = true;
-      return;
-    }
-    const commentId = stringValue(comment.id);
-    if (!commentId) return;
-    const children = await collectList(
-      client,
-      `/wiki/api/v2/${suffix}/${encodeURIComponent(commentId)}/children`,
-      { 'body-format': args.bodyFormat },
-      Math.min(args.maxItems - itemCount, MAX_SECTION_ITEMS),
-    );
-    apiCalls += children.apiCalls;
-    errors.push(...children.errors);
-    if (children.truncated || children.nextCursor) truncated = true;
-    const replies: JsonRecord[] = [];
-    for (const child of children.items) {
-      if (itemCount >= args.maxItems) {
-        truncated = true;
-        break;
-      }
-      const childRecord = asRecord(child) ?? {};
-      itemCount += 1;
-      replies.push(childRecord);
-      await visit(childRecord, depth + 1);
-    }
-    comment.replies = replies;
-  };
-
+  // Confluence has no bulk reply endpoint, so each level still costs one call per comment.
+  // Levels are walked breadth-first with bounded concurrency and an explicit call budget so a
+  // large thread cannot turn into a long chain of sequential requests inside one tool call.
   const root = asRecord(rootResponse.data) ?? { data: rootResponse.data };
-  await visit(root, 0);
+  let frontier: JsonRecord[] = [root];
+  for (let depth = 0; depth < args.maxDepth && frontier.length > 0; depth += 1) {
+    if (itemCount >= args.maxItems || apiCalls >= MAX_THREAD_API_CALLS) break;
+    const affordable = Math.min(frontier.length, MAX_THREAD_API_CALLS - apiCalls);
+    const targets = frontier.slice(0, affordable);
+    const perComment = Math.min(Math.max(args.maxItems - itemCount, 1), MAX_SECTION_ITEMS);
+    const childPages = await mapWithConcurrency(targets, THREAD_CHILD_CONCURRENCY, (comment) => {
+      const commentId = stringValue(comment.id);
+      if (!commentId) return Promise.resolve(undefined);
+      return collectList(
+        client,
+        `/wiki/api/v2/${suffix}/${encodeURIComponent(commentId)}/children`,
+        { 'body-format': args.bodyFormat },
+        perComment,
+      );
+    });
+    const next: JsonRecord[] = [];
+    targets.forEach((comment, index) => {
+      const children = childPages[index];
+      if (!children) return;
+      apiCalls += children.apiCalls;
+      errors.push(...children.errors);
+      if (children.truncated) truncated = true;
+      const replies: JsonRecord[] = [];
+      for (const child of children.items) {
+        if (itemCount >= args.maxItems) {
+          truncated = true;
+          break;
+        }
+        const childRecord = asRecord(child) ?? {};
+        itemCount += 1;
+        replies.push(childRecord);
+        next.push(childRecord);
+      }
+      comment.replies = replies;
+    });
+    if (targets.length < frontier.length) truncated = true;
+    frontier = next;
+  }
+  if (frontier.length > 0) truncated = true;
   return {
     root,
     status: {
@@ -753,9 +803,10 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
     'confluence_get_space_overview',
     {
       description:
-        'HIGH-LEVEL: Get space metadata and the homepage/root content tree in one MCP call. Prefer this when first learning a space instead of listing spaces, fetching the space, and recursively listing children. The tree is always budgeted and reports partial/truncated state.',
+        'HIGH-LEVEL: Get space metadata and the homepage/root content tree in one MCP call. Prefer this when first learning a space instead of listing spaces, fetching the space, and recursively listing children. Provide either space_id or space_key; with space_key (for example DOCS) the server resolves the numeric space id itself. The tree is always budgeted and reports partial/truncated state.',
       inputSchema: z.object({
-        space_id: z.string().min(1),
+        space_id: z.string().min(1).optional(),
+        space_key: z.string().min(1).optional(),
         root_id: z.string().optional(),
         root_type: z.enum(['page', 'folder']).default('page'),
         depth: z.number().int().min(0).max(TREE_MAX_DEPTH).default(DEFAULT_TREE_DEPTH),
@@ -763,17 +814,19 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
         max_chars: maxChars,
       }),
     },
-    highLevelError(async ({ space_id, root_id, root_type, depth, max_items, max_chars: chars }) =>
-      toolResult(
-        await getSpaceOverview(client, {
-          spaceId: space_id,
-          rootId: root_id,
-          rootType: root_type,
-          depth,
-          maxItems: max_items,
-        }),
-        chars,
-      ),
+    highLevelError(
+      async ({ space_id, space_key, root_id, root_type, depth, max_items, max_chars: chars }) =>
+        toolResult(
+          await getSpaceOverview(client, {
+            spaceId: space_id,
+            spaceKey: space_key,
+            rootId: root_id,
+            rootType: root_type,
+            depth,
+            maxItems: max_items,
+          }),
+          chars,
+        ),
     ),
   );
 

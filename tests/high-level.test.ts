@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ConfluenceClient } from '../src/client/confluence-client.js';
 import {
   collectCursorPages,
+  getCommentThread,
   getPageContext,
+  getSpaceOverview,
   reconstructContentTree,
   searchAndFetch,
 } from '../src/tools/high-level.js';
@@ -100,5 +102,55 @@ describe('high-level combined reads', () => {
 
     expect(result.status).toMatchObject({ partial: true });
     expect(JSON.stringify(result.sections)).toContain('permission denied');
+  });
+});
+
+describe('high-level traversal budgets', () => {
+  it('walks a comment thread level by level and reports depth truncation', async () => {
+    const children: Record<string, unknown[]> = {
+      root: [{ id: 'reply-1' }, { id: 'reply-2' }],
+      'reply-1': [{ id: 'reply-1-1' }],
+    };
+    const client = mockClient((path) => {
+      const match = /footer-comments\/([^/]+)\/children$/.exec(path);
+      if (match) return { results: children[match[1] ?? ''] ?? [] };
+      return { id: 'root', body: { storage: { value: 'root comment' } } };
+    });
+
+    const result = await getCommentThread(client, {
+      commentId: 'root',
+      commentType: 'footer',
+      bodyFormat: 'storage',
+      maxDepth: 2,
+      maxItems: 50,
+    });
+
+    const root = result.root as { replies?: Array<{ id: string; replies?: unknown[] }> };
+    expect(root.replies?.map((reply) => reply.id)).toEqual(['reply-1', 'reply-2']);
+    expect(root.replies?.[0]?.replies).toHaveLength(1);
+    // root + two level-2 comments, so no call is made for the leaf level.
+    expect(client.requestJson).toHaveBeenCalledTimes(4);
+    expect(result.status).toMatchObject({ itemsReturned: 4, truncated: true, partial: false });
+  });
+
+  it('resolves a space key without an extra caller round trip', async () => {
+    const client = mockClient((path) => {
+      if (path === '/wiki/api/v2/spaces') return { results: [{ id: '900', key: 'DOCS' }] };
+      if (path === '/wiki/api/v2/spaces/900') return { id: '900', homepageId: '5' };
+      if (path === '/wiki/api/v2/pages/5') return { id: '5', title: 'Home' };
+      return { results: [{ id: '6', title: 'Child', parentId: '5', depth: 1 }] };
+    });
+
+    const result = await getSpaceOverview(client, {
+      spaceKey: 'DOCS',
+      rootType: 'page',
+      depth: 2,
+      maxItems: 100,
+    });
+
+    expect(result.spaceId).toBe('900');
+    const tree = result.tree as { root: { children: Array<{ id: string }> } };
+    expect(tree.root.children.map((child) => child.id)).toEqual(['6']);
+    expect(client.requestJson).toHaveBeenCalledTimes(4);
   });
 });
