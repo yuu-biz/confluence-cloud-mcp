@@ -2,6 +2,10 @@
   "name": "confluence-cloud-mcp",
   "version": "0.1.0",
   "description": "A local stdio MCP server for Confluence Cloud REST API v1 and v2.",
+  "author": {
+    "name": "Yuu Momma",
+    "email": "yuumomma@gmail.com"
+  },
   "type": "module",
   "private": false,
   "engines": {

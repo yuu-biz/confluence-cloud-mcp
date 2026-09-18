@@ -7,7 +7,8 @@
   "description": "Search, read, navigate, and update Confluence Cloud through a local MCP server.",
   "long_description": "A local stdio MCP server for Confluence Cloud REST API v1 and v2. Credentials are collected through Claude Desktop's secure extension configuration and are passed only as environment variables to the server.",
   "author": {
-    "name": "Contributors"
+    "name": "Yuu Momma",
+    "email": "yuumomma@gmail.com"
   },
   "repository": {
     "type": "git",
