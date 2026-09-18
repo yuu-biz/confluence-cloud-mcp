@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+mcpb/server/
+mcpb/node_modules/
+mcpb/package-lock.json
+*.mcpb
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db

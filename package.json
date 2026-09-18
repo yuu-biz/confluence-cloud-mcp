@@ -1,0 +1,46 @@
+{
+  "name": "confluence-cloud-mcp",
+  "version": "0.1.0",
+  "description": "A local stdio MCP server for Confluence Cloud REST API v1 and v2.",
+  "type": "module",
+  "private": false,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "confluence-cloud-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:bundle": "npm run build",
+    "build:mcpb": "npm run build:bundle && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/pack-mcpb.ps1",
+    "check": "npm run format:check && npm run lint && npm run typecheck",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^24.10.1",
+    "@typescript-eslint/eslint-plugin": "^8.48.0",
+    "@typescript-eslint/parser": "^8.48.0",
+    "eslint": "^9.39.1",
+    "prettier": "^3.7.4",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.0",
+    "vitest": "^4.0.8"
+  }
+}

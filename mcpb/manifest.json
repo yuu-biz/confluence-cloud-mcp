@@ -1,0 +1,84 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "confluence-cloud-mcp",
+  "display_name": "Confluence Cloud MCP",
+  "version": "0.1.0",
+  "description": "Search, read, navigate, and update Confluence Cloud through a local MCP server.",
+  "long_description": "A local stdio MCP server for Confluence Cloud REST API v1 and v2. Credentials are collected through Claude Desktop's secure extension configuration and are passed only as environment variables to the server.",
+  "author": {
+    "name": "Contributors"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yuu-biz/confluence-cloud-mcp"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server/main.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/main.js"],
+      "env": {
+        "CONFLUENCE_BASE_URL": "${user_config.base_url}",
+        "CONFLUENCE_EMAIL": "${user_config.email}",
+        "CONFLUENCE_API_TOKEN": "${user_config.api_token}",
+        "CONFLUENCE_ALLOW_DESTRUCTIVE_OPERATIONS": "${user_config.allow_destructive_operations}",
+        "CONFLUENCE_ALLOW_RAW_WRITE": "${user_config.allow_raw_write}",
+        "CONFLUENCE_ALLOW_LOCAL_FILE_UPLOAD": "${user_config.allow_local_file_upload}",
+        "CONFLUENCE_REQUEST_TIMEOUT_MS": "${user_config.request_timeout_ms}"
+      }
+    }
+  },
+  "user_config": {
+    "base_url": {
+      "type": "string",
+      "title": "Confluence site URL",
+      "description": "HTTPS site URL without /wiki, for example https://example.atlassian.net",
+      "required": true
+    },
+    "email": {
+      "type": "string",
+      "title": "Atlassian email",
+      "description": "Email address associated with the Atlassian API token",
+      "required": true
+    },
+    "api_token": {
+      "type": "string",
+      "title": "Atlassian API token",
+      "description": "Create a token at id.atlassian.com/manage-profile/security/api-tokens",
+      "sensitive": true,
+      "required": true
+    },
+    "allow_destructive_operations": {
+      "type": "boolean",
+      "title": "Enable destructive operations",
+      "description": "Allows delete and purge tools, which still require confirm=true.",
+      "default": false
+    },
+    "allow_raw_write": {
+      "type": "boolean",
+      "title": "Enable raw write requests",
+      "description": "Allows non-GET raw requests, which still require confirm=true.",
+      "default": false
+    },
+    "allow_local_file_upload": {
+      "type": "boolean",
+      "title": "Enable local file upload",
+      "description": "Allows the attachment tool to read a local file after confirm=true.",
+      "default": false
+    },
+    "request_timeout_ms": {
+      "type": "number",
+      "title": "Request timeout (ms)",
+      "description": "HTTP timeout in milliseconds.",
+      "default": 30000,
+      "min": 5000,
+      "max": 120000
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": ["darwin", "win32", "linux"]
+  }
+}
