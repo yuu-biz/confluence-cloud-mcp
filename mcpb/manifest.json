@@ -3,7 +3,7 @@
   "manifest_version": "0.4",
   "name": "confluence-cloud-mcp",
   "display_name": "Confluence Cloud MCP",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Search, read, navigate, and update Confluence Cloud through a local MCP server.",
   "long_description": "A local stdio MCP server for Confluence Cloud REST API v1 and v2. Credentials are collected through Claude Desktop's secure extension configuration and are passed only as environment variables to the server.",
   "author": {

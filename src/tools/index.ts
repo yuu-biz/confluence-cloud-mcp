@@ -7,6 +7,7 @@ import type { ConfluenceClient } from '../client/confluence-client.js';
 import { extractNextCursor } from '../client/confluence-client.js';
 import { publicErrorMessage } from '../client/errors.js';
 import { toolResult } from './response.js';
+import { registerHighLevelTools } from './high-level.js';
 
 const bodyFormat = z
   .enum(['storage', 'atlas_doc_format', 'view', 'export_view', 'styled_view'])
@@ -90,11 +91,12 @@ export function registerConfluenceTools(
   client: ConfluenceClient,
   config: AppConfig,
 ): void {
+  registerHighLevelTools(server, client);
   server.registerTool(
     'confluence_search',
     {
       description:
-        'Search Confluence content with CQL. Use this first when the page ID or exact location is unknown. Results are compact and paginated.',
+        'Primitive: search Confluence content with CQL when only compact search metadata is needed. For search plus page bodies in one call, prefer confluence_search_and_fetch.',
       inputSchema: z.object({
         cql: z.string().min(1).max(4_000),
         limit: z.number().int().min(1).max(100).default(25),
@@ -194,7 +196,7 @@ export function registerConfluenceTools(
     'confluence_get_page',
     {
       description:
-        'Get one Confluence page by ID, including a requested body representation and optional labels, properties, operations, likes, and version metadata.',
+        'Primitive: get one Confluence page by ID. For a page understanding bundle with ancestors, attachments, or comments, prefer confluence_get_page_context.',
       inputSchema: z.object({
         page_id: z.string().min(1),
         body_format: bodyFormat,
@@ -305,7 +307,8 @@ export function registerConfluenceTools(
   server.registerTool(
     'confluence_get_space',
     {
-      description: 'Get one Confluence space by ID.',
+      description:
+        'Primitive: get one Confluence space by ID. When first understanding a space and its structure, prefer confluence_get_space_overview.',
       inputSchema: z.object({
         space_id: z.string().min(1),
         description_format: z.string().optional(),
@@ -407,7 +410,7 @@ export function registerConfluenceTools(
     'confluence_list_children',
     {
       description:
-        'List direct children in the Confluence content tree. Supports page and folder parents; use each child ID with confluence_get_page when details are needed.',
+        'Primitive: list one direct level of page or folder children. For a subtree, prefer confluence_get_content_tree so the server handles descendants pagination and reconstruction in one MCP call.',
       inputSchema: z.object({
         parent_id: z.string().min(1),
         parent_type: z.enum(['page', 'folder']).default('page'),
@@ -437,7 +440,7 @@ export function registerConfluenceTools(
     'confluence_list_descendants',
     {
       description:
-        'List descendants below a page or folder in top-to-bottom order. Use depth to control traversal size and cursor to continue.',
+        'Primitive: list one paginated descendants response below a page or folder. For a complete bounded tree with parent/child nesting, prefer confluence_get_content_tree.',
       inputSchema: z.object({
         parent_id: z.string().min(1),
         parent_type: z.enum(['page', 'folder']).default('page'),
@@ -567,7 +570,7 @@ export function registerConfluenceTools(
     'confluence_list_comments',
     {
       description:
-        'List root footer or inline comments on a page. Use comment_type=inline for inline discussions and cursor for pagination.',
+        'Primitive: list root footer or inline comments on a page. For one discussion and all bounded replies, prefer confluence_get_comment_thread; use this for a single page-level comment list.',
       inputSchema: z.object({
         page_id: z.string().min(1),
         comment_type: z.enum(['footer', 'inline']).default('footer'),

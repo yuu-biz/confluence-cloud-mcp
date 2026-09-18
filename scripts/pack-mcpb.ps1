@@ -3,12 +3,16 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $bundle = Join-Path $root 'mcpb'
 $serverDir = Join-Path $bundle 'server'
+$nodeModules = Join-Path $bundle 'node_modules'
 $dist = Join-Path $root 'dist'
 
 New-Item -ItemType Directory -Force -Path $serverDir | Out-Null
 Get-ChildItem -LiteralPath $serverDir -Force | Remove-Item -Recurse -Force
 Copy-Item -Path (Join-Path $dist '*') -Destination $serverDir -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $bundle 'LICENSE') -Force
+
+if (Test-Path -LiteralPath $nodeModules) { Remove-Item -LiteralPath $nodeModules -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $nodeModules | Out-Null
 
 $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if (-not $npmCommand) { $npmCommand = Get-Command npm -ErrorAction SilentlyContinue }
