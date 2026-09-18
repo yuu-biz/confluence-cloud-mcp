@@ -107,6 +107,12 @@ High-level Toolを通常優先してください。サーバー内部でpaginati
 
 `max_chars`は1,000〜50,000の範囲にクランプされます。指定値と実効値が異なる場合も`status.outputBudget`で確認できます。
 
+`truncationReasons`に`output_budget`が入っている場合、**取得済み（`fetchedItems`）のうちrenderできなかった分**なので、`max_chars`を上げるだけで追加のAPI呼び出しなしに表示を増やせます。compact renderは残り予算で折り畳んだbranchを可能な限り展開するため、予算を上げた分はそのまま表示ノード数に反映されます。
+
+### 続きの取得（cursor）
+
+`status.nextCursor`が返った場合は、同じ`root_id` / `depth` / `output_mode`のまま`cursor`に渡すと続きから取得できます（`confluence_get_content_tree`、`confluence_get_space_overview`）。継続ページでは親が前ページに含まれるnodeが出るため、それらはrootの直下に並べ、件数を`status.unresolvedParents`で報告します（エラー扱いにはしません）。`status.cursorUsed`には実際に使ったcursorが入ります。
+
 ### Search mode
 
 `confluence_search_and_fetch`はCQLを書かずに`query`を渡せます。`search_mode`は`auto`（default）で、`title = "..."`（完全一致）→ `title ~ "...*"`（前方一致）→ `text ~ "..."`（全文）の順に試し、最初にhitした時点で止まります。full-text検索はtokenizeされるため、識別子や型番のように正確なtitleが分かっている場合はこの順序が有効です。`exact_title` / `title_prefix` / `full_text`で固定でき、`cql`は手書きクエリ用のescape hatchです。実際に使われたCQLは`strategy.cqlUsed`に入ります。

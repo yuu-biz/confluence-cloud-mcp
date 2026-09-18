@@ -127,12 +127,15 @@ describe('compact content tree', () => {
 
     const status = result.status as Record<string, unknown>;
     const omitted = result.omittedBranches as Array<Record<string, unknown>>;
-    expect(status.renderedDepth).toBe(1);
     expect(status.truncationReasons).toContain('output_budget');
-    // Branches that did not fit are named rather than silently dropped.
-    expect(omitted.length).toBeGreaterThan(0);
-    const renderedLines = (result.tree as string).split('\n').length;
-    expect(renderedLines + omitted.length).toBeGreaterThanOrEqual(FIXTURE_BRANCH_COUNT);
+    // Every branch is either rendered or named in omittedBranches; none is silently dropped.
+    const tree = result.tree as string;
+    for (let index = 0; index < FIXTURE_BRANCH_COUNT; index += 1) {
+      const id = `b${index}`;
+      const visible = tree.includes(`[${id}]`) || omitted.some((branch) => branch.id === id);
+      expect(visible).toBe(true);
+    }
+    expect(tree.length).toBeLessThanOrEqual(1_000);
   });
 
   it('maps a large tree from one cheap outline read', async () => {
@@ -175,6 +178,71 @@ describe('compact content tree', () => {
     expect(status.truncationReasons).not.toContain('output_budget');
     expect(status.nextCursor).toBeDefined();
     expect(status.paginationExhausted).toBe(false);
+  });
+
+  it('continues from a returned cursor instead of repeating the first page', async () => {
+    const { client, calls } = treeClient({ pageSize: 20 });
+    const first = await fetchContentTree(client, {
+      ...treeArgs,
+      maxItems: 20,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(50_000),
+    });
+    const firstStatus = first.status as Record<string, unknown>;
+    expect(firstStatus.nextCursor).toBeDefined();
+    expect(first.nextStep).toContain('nextCursor');
+
+    const second = await fetchContentTree(client, {
+      ...treeArgs,
+      maxItems: 20,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(50_000),
+      cursor: firstStatus.nextCursor as string,
+    });
+    const secondStatus = second.status as Record<string, unknown>;
+
+    // The second call requests the cursor it was given and returns different content.
+    const descendantCalls = calls.filter((call) => call.path.endsWith('/descendants'));
+    expect(descendantCalls[0]?.query?.cursor).toBeUndefined();
+    expect(descendantCalls[1]?.query?.cursor).toBe(firstStatus.nextCursor);
+    expect(secondStatus.cursorUsed).toBe(firstStatus.nextCursor);
+    expect(second.tree).not.toBe(first.tree);
+    expect(secondStatus.nextCursor).not.toBe(firstStatus.nextCursor);
+  });
+
+  it('treats parents returned on an earlier page as expected, not as errors', async () => {
+    const { client } = treeClient({ pageSize: 20 });
+    const first = await fetchContentTree(client, {
+      ...treeArgs,
+      maxItems: 20,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(50_000),
+    });
+    const second = await fetchContentTree(client, {
+      ...treeArgs,
+      maxItems: 20,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(50_000),
+      cursor: (first.status as Record<string, unknown>).nextCursor as string,
+    });
+
+    const status = second.status as Record<string, unknown>;
+    expect(status.unresolvedParents).toBeGreaterThan(0);
+    expect(status.truncationReasons).not.toContain('api_error');
+    expect(status.errors).toBeUndefined();
+    expect(second.nextStep).toContain('continues an earlier one');
+  });
+
+  it('points at the free budget headroom before suggesting more calls', async () => {
+    const { client } = treeClient();
+    const result = await fetchContentTree(client, {
+      ...treeArgs,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(3_000),
+    });
+
+    expect(result.nextStep).toContain('max_chars=50000');
+    expect((result.status as Record<string, unknown>).truncationReasons).toContain('output_budget');
   });
 
   it('reports requested and effective output budgets', async () => {

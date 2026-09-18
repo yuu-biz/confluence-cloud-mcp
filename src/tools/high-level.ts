@@ -28,6 +28,7 @@ const MAX_PAGINATION_PAGES = 20;
 const OUTLINE_FETCH_ITEMS = 600;
 const OUTLINE_DEPTH = 2;
 const MAX_OMITTED_BRANCHES = 40;
+const MAX_EXPANSION_ATTEMPTS = 400;
 // Share of the output budget spent on the rendered tree, leaving room for status and hints.
 const TREE_TEXT_BUDGET_RATIO = 0.7;
 const THREAD_CHILD_CONCURRENCY = 4;
@@ -81,6 +82,8 @@ export interface ContentTreeNode extends ContentTreeItem {
 export interface ContentTreeBuildResult {
   root: ContentTreeNode;
   warnings: string[];
+  /** Nodes whose parent was not part of this page; expected when resuming with a cursor. */
+  unresolvedParents: string[];
 }
 
 export function reconstructContentTree(
@@ -91,6 +94,7 @@ export function reconstructContentTree(
   const nodes = new Map<string, ContentTreeNode>();
   const order = new Map<string, number>();
   const warnings: string[] = [];
+  const unresolvedParents: string[] = [];
 
   rawItems.forEach((raw, index) => {
     const item = compactContentItem(raw);
@@ -120,7 +124,7 @@ export function reconstructContentTree(
       parent.children.push(node);
     } else {
       if (node.parentId && node.parentId !== root.id) {
-        warnings.push(`Unknown parent attached to root: ${node.id}`);
+        unresolvedParents.push(node.id);
       }
       rootNode.children.push(node);
     }
@@ -139,7 +143,7 @@ export function reconstructContentTree(
     for (const child of node.children) sortChildren(child);
   };
   sortChildren(rootNode);
-  return { root: rootNode, warnings };
+  return { root: rootNode, warnings, unresolvedParents };
 }
 
 export type TreeOutputMode = 'compact' | 'outline' | 'detailed';
@@ -191,25 +195,60 @@ function omittedBranch(node: ContentTreeNode): OmittedBranch {
   };
 }
 
-function renderAtDepth(
+interface DepthRender {
+  lines: string[];
+  renderedItems: number;
+  omittedBranches: OmittedBranch[];
+  collapsed: ContentTreeNode[];
+}
+
+/**
+ * Renders every node down to baseDepth, plus the children of any node in `expanded`. Nodes that
+ * still have unrendered children come back in `collapsed`, so leftover budget can be spent on
+ * them and whatever stays collapsed can be reported.
+ */
+function renderTree(
   root: ContentTreeNode,
-  maxDepth: number,
-): { lines: string[]; renderedItems: number; omittedBranches: OmittedBranch[] } {
+  baseDepth: number,
+  expanded: ReadonlySet<string>,
+): DepthRender {
   const lines: string[] = [];
   const omittedBranches: OmittedBranch[] = [];
+  const collapsed: ContentTreeNode[] = [];
   let renderedItems = 0;
   const walk = (node: ContentTreeNode, depth: number): void => {
     lines.push(nodeLine(node, depth, depth > 0));
     if (depth > 0) renderedItems += 1;
     if (node.children.length === 0) return;
-    if (depth >= maxDepth) {
+    if (depth >= baseDepth && !expanded.has(node.id)) {
       omittedBranches.push(omittedBranch(node));
+      collapsed.push(node);
       return;
     }
     for (const child of node.children) walk(child, depth + 1);
   };
   walk(root, 0);
-  return { lines, renderedItems, omittedBranches };
+  return { lines, renderedItems, omittedBranches, collapsed };
+}
+
+function textLength(lines: string[]): number {
+  return lines.reduce((total, line) => total + line.length + 1, -1);
+}
+
+function renderedDepthOf(
+  root: ContentTreeNode,
+  baseDepth: number,
+  expanded: ReadonlySet<string>,
+): number {
+  let deepest = 0;
+  const walk = (node: ContentTreeNode, depth: number): void => {
+    deepest = Math.max(deepest, depth);
+    if (node.children.length === 0) return;
+    if (depth >= baseDepth && !expanded.has(node.id)) return;
+    for (const child of node.children) walk(child, depth + 1);
+  };
+  walk(root, 0);
+  return deepest;
 }
 
 /**
@@ -219,19 +258,46 @@ function renderAtDepth(
  */
 export function renderCompactTree(root: ContentTreeNode, budgetChars: number): TreeRender {
   const deepest = treeDepth(root);
+  const expanded = new Set<string>();
+  let baseDepth = 0;
   for (let depth = deepest; depth >= 1; depth -= 1) {
-    const attempt = renderAtDepth(root, depth);
-    const text = attempt.lines.join('\n');
-    if (text.length > budgetChars) continue;
+    if (textLength(renderTree(root, depth, expanded).lines) <= budgetChars) {
+      baseDepth = depth;
+      break;
+    }
+  }
+
+  if (baseDepth > 0) {
+    // Spend the remaining budget expanding collapsed branches in document order. Without this a
+    // tree that just misses the next full level would return a whole level less than it could.
+    let render = renderTree(root, baseDepth, expanded);
+    let attempts = 0;
+    let progressed = true;
+    while (progressed && attempts < MAX_EXPANSION_ATTEMPTS) {
+      progressed = false;
+      for (const node of render.collapsed) {
+        if (attempts >= MAX_EXPANSION_ATTEMPTS) break;
+        attempts += 1;
+        expanded.add(node.id);
+        const trial = renderTree(root, baseDepth, expanded);
+        if (textLength(trial.lines) <= budgetChars) {
+          render = trial;
+          progressed = true;
+        } else {
+          expanded.delete(node.id);
+        }
+      }
+    }
     return {
-      text,
-      renderedItems: attempt.renderedItems,
-      renderedDepth: depth,
-      omittedBranches: attempt.omittedBranches.slice(0, MAX_OMITTED_BRANCHES),
-      branchesNotListed: Math.max(0, attempt.omittedBranches.length - MAX_OMITTED_BRANCHES),
+      text: render.lines.join('\n'),
+      renderedItems: render.renderedItems,
+      renderedDepth: renderedDepthOf(root, baseDepth, expanded),
+      omittedBranches: render.omittedBranches.slice(0, MAX_OMITTED_BRANCHES),
+      branchesNotListed: Math.max(0, render.omittedBranches.length - MAX_OMITTED_BRANCHES),
       budgetExceeded: false,
     };
   }
+
   if (deepest === 0) {
     return {
       text: nodeLine(root, 0, false),
@@ -322,11 +388,12 @@ export interface CursorCollection<T> {
 export async function collectCursorPages<T>(
   request: (cursor: string | undefined, limit: number) => Promise<ClientResponse>,
   maxItems: number,
+  startCursor?: string,
 ): Promise<CursorCollection<T>> {
   const items: T[] = [];
   const errors: string[] = [];
   const seenCursors = new Set<string>();
-  let cursor: string | undefined;
+  let cursor: string | undefined = startCursor;
   let pagesFetched = 0;
   let nextCursor: string | undefined;
   let stopReason: CursorCollection<T>['stopReason'] = 'complete';
@@ -395,6 +462,8 @@ export interface ContentTreeOptions {
   maxItems: number;
   outputMode: TreeOutputMode;
   budget: OutputBudget;
+  /** status.nextCursor from a previous call, to continue the same traversal. */
+  cursor?: string | undefined;
 }
 
 function paginationReason(stopReason: CursorCollection<unknown>['stopReason']): string | undefined {
@@ -427,6 +496,7 @@ export async function fetchContentTree(
         { depth: fetchDepth, cursor, limit },
       ),
     fetchMaxItems,
+    options.cursor,
   );
   const [rootResult, descendantResult] = await Promise.allSettled([rootRequest, descendants]);
 
@@ -454,6 +524,7 @@ export async function fetchContentTree(
   errors.push(...build.warnings);
 
   const fetchedItems = pageData.items.length;
+  const continued = Boolean(options.cursor);
   const textBudget = Math.max(
     500,
     Math.floor(options.budget.effectiveChars * TREE_TEXT_BUDGET_RATIO),
@@ -488,7 +559,9 @@ export async function fetchContentTree(
       truncated: truncationReasons.size > 0,
       truncationReasons: truncationReasons.size > 0 ? [...truncationReasons] : undefined,
       paginationExhausted: pageData.paginationExhausted,
+      cursorUsed: options.cursor,
       nextCursor: pageData.nextCursor,
+      unresolvedParents: build.unresolvedParents.length || undefined,
       apiCalls: pageData.apiCalls + 1,
       outputBudget: options.budget,
       errors: errors.length > 0 ? errors : undefined,
@@ -501,14 +574,36 @@ export async function fetchContentTree(
   } else {
     output.treeNodes = build.root;
   }
+  const nextSteps: string[] = [];
+  if (
+    truncationReasons.has('output_budget') &&
+    options.budget.effectiveChars < options.budget.hardCapChars
+  ) {
+    nextSteps.push(
+      `Everything counted in fetchedItems was already retrieved: re-run with max_chars=${options.budget.hardCapChars} to render more of it without extra API calls.`,
+    );
+  }
+  if (pageData.nextCursor) {
+    nextSteps.push(
+      'Continue the same traversal by passing status.nextCursor back as cursor with the same root_id, depth and output_mode.',
+    );
+  }
   if (omittedBranches.length > 0) {
     output.omittedBranches = omittedBranches;
-    output.nextStep =
-      'Expand only the branches you need: call confluence_get_content_tree with root_id set to an omitted branch id.';
+    nextSteps.push(
+      'Expand a specific branch by calling confluence_get_content_tree with root_id set to an omittedBranches id.',
+    );
   } else if (outline) {
-    output.nextStep =
-      'Pick the branches that matter and call confluence_get_content_tree with root_id set to their ids.';
+    nextSteps.push(
+      'Pick the branches that matter and call confluence_get_content_tree with root_id set to their ids.',
+    );
   }
+  if (continued && build.unresolvedParents.length > 0) {
+    nextSteps.push(
+      'This page continues an earlier one, so nodes whose parent was returned earlier are listed directly under the root.',
+    );
+  }
+  if (nextSteps.length > 0) output.nextStep = nextSteps.join(' ');
   if (render?.branchesNotListed) output.omittedBranchesNotListed = render.branchesNotListed;
   return output;
 }
@@ -845,6 +940,7 @@ export async function getSpaceOverview(
     maxItems: number;
     outputMode: TreeOutputMode;
     budget: OutputBudget;
+    cursor?: string | undefined;
   },
 ): Promise<JsonRecord> {
   let spaceId = args.spaceId;
@@ -885,6 +981,7 @@ export async function getSpaceOverview(
     maxItems: args.maxItems,
     outputMode: args.outputMode,
     budget: args.budget,
+    cursor: args.cursor,
   });
   return {
     space: spaceResult,
@@ -995,18 +1092,19 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
     'confluence_get_content_tree',
     {
       description:
-        'HIGH-LEVEL: Get a page or folder hierarchy in one MCP call, rendered as an indented text tree (title [id], a trailing / marks folders). Prefer this over recursively calling confluence_list_children: the server reads v2 descendants, consumes cursor pagination, and rebuilds the hierarchy. output_mode=compact (default) returns the deepest view that fits the output budget and lists collapsed branches in omittedBranches, so a follow-up call can expand only what matters; output_mode=outline returns just the direct children with child counts and is the cheapest way to map a large or unknown tree first; output_mode=detailed returns raw node objects and is only worth it when parentId, childPosition or status are needed. status separates fetchedItems from renderedItems and names every truncationReason.',
+        'HIGH-LEVEL: Get a page or folder hierarchy in one MCP call, rendered as an indented text tree (title [id], a trailing / marks folders). Prefer this over recursively calling confluence_list_children: the server reads v2 descendants, consumes cursor pagination, and rebuilds the hierarchy. output_mode=compact (default) returns the deepest view that fits the output budget and lists collapsed branches in omittedBranches, so a follow-up call can expand only what matters; output_mode=outline returns just the direct children with child counts and is the cheapest way to map a large or unknown tree first; output_mode=detailed returns raw node objects and is only worth it when parentId, childPosition or status are needed. status separates fetchedItems from renderedItems and names every truncationReason. When status.nextCursor is returned, pass it back as cursor with the same root_id, depth and output_mode to continue the traversal; when truncationReasons contains output_budget, raising max_chars renders more of what was already fetched without extra API calls.',
       inputSchema: z.object({
         root_id: z.string().min(1),
         root_type: z.enum(['page', 'folder']).default('page'),
         output_mode: z.enum(['compact', 'outline', 'detailed']).default('compact'),
         depth: z.number().int().min(0).max(TREE_MAX_DEPTH).default(DEFAULT_TREE_DEPTH),
         max_items: z.number().int().min(1).max(TREE_MAX_ITEMS).default(DEFAULT_TREE_ITEMS),
+        cursor: z.string().optional(),
         max_chars: maxChars,
       }),
     },
     highLevelError(
-      async ({ root_id, root_type, output_mode, depth, max_items, max_chars: chars }) =>
+      async ({ root_id, root_type, output_mode, depth, max_items, cursor, max_chars: chars }) =>
         toolResult(
           await fetchContentTree(client, {
             rootId: root_id,
@@ -1015,6 +1113,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
             maxItems: max_items,
             outputMode: output_mode,
             budget: resolveOutputBudget(chars),
+            cursor,
           }),
           chars,
         ),
@@ -1133,7 +1232,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
     'confluence_get_space_overview',
     {
       description:
-        'HIGH-LEVEL: Get space metadata and the homepage/root content tree in one MCP call. Prefer this when first learning a space instead of listing spaces, fetching the space, and recursively listing children. Provide either space_id or space_key; with space_key (for example DOCS) the server resolves the numeric space id itself. The tree is always budgeted and reports partial/truncated state.',
+        'HIGH-LEVEL: Get space metadata and the homepage/root content tree in one MCP call. Prefer this when first learning a space instead of listing spaces, fetching the space, and recursively listing children. Provide either space_id or space_key; with space_key (for example DOCS) the server resolves the numeric space id itself. status.nextCursor can be passed back as cursor to continue the tree traversal. The tree is always budgeted and reports partial/truncated state.',
       inputSchema: z.object({
         space_id: z.string().min(1).optional(),
         space_key: z.string().min(1).optional(),
@@ -1142,6 +1241,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
         output_mode: z.enum(['compact', 'outline', 'detailed']).default('compact'),
         depth: z.number().int().min(0).max(TREE_MAX_DEPTH).default(DEFAULT_TREE_DEPTH),
         max_items: z.number().int().min(1).max(TREE_MAX_ITEMS).default(DEFAULT_TREE_ITEMS),
+        cursor: z.string().optional(),
         max_chars: maxChars,
       }),
     },
@@ -1154,6 +1254,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
         output_mode,
         depth,
         max_items,
+        cursor,
         max_chars: chars,
       }) =>
         toolResult(
@@ -1166,6 +1267,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
             maxItems: max_items,
             outputMode: output_mode,
             budget: resolveOutputBudget(chars),
+            cursor,
           }),
           chars,
         ),
