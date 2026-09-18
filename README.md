@@ -78,17 +78,38 @@ npm run build:mcpb
 
 Extension manifestはMCPB manifest v0.4を使い、API tokenを`sensitive: true`のuser configurationから環境変数として渡します。MCPBにはOS-level sandboxがないため、write系の安全制御はサーバー側でも行っています。
 
-High-level Toolを通常優先してください。サーバー内部でpagination、階層再構成、複数API呼び出しを処理するため、Claude DesktopからのTool Callを減らせます。Primitive Toolは、単一リソース・単一階層だけが必要な場合や、High-level Toolにない細かな操作に使います。
+High-level Toolを通常優先してください。サーバー内部でpagination、階層再構成、複数API呼び出しを処理するため、Claude DesktopからのTool Callを減らせます。Primitive Toolは、1リソース・1階層だけが必要な場合、cursorを自分で制御したい場合、High-level Toolが公開していないフィールドを使いたい場合に使います。
 
-| High-level Tool               | 集約する処理                                                              |
-| ----------------------------- | ------------------------------------------------------------------------- |
-| confluence_get_content_tree   | v2 descendantsのcursor pagination、root取得、parentIdからのtree再構成     |
-| confluence_search_and_fetch   | v1 CQL searchと上位ページのv2本文取得                                     |
-| confluence_get_page_context   | ページ本文・current versionと、指定したancestors / attachments / comments |
-| confluence_get_space_overview | Space metadataとhomepage/root以下のbounded content tree                   |
-| confluence_get_comment_thread | コメント本体とv2 child commentsのreply tree                               |
+| High-level Tool               | 集約する処理                                                                |
+| ----------------------------- | --------------------------------------------------------------------------- |
+| confluence_get_content_tree   | v2 descendantsのcursor pagination、root取得、階層再構成、budget内でのrender |
+| confluence_search_and_fetch   | query→CQL変換、v1 search、上位ページのv2本文取得                            |
+| confluence_get_page_context   | ページ本文・current versionと、指定したancestors / attachments / comments   |
+| confluence_get_space_overview | space key解決、Space metadata、homepage/root以下のcontent tree              |
+| confluence_get_comment_thread | コメント本体とv2 child commentsのreply tree                                 |
 
-High-level Toolには depth、max_items、max_items_per_section、fetch_top、max_chars_per_page などのbudgetがあります。上限に達した場合はレスポンスの status.truncated、status.partial、status.paginationExhausted、status.errors で判別できます。大規模Spaceや長い本文では、最初から小さいbudgetを指定してください。
+### Content treeのoutput mode
+
+`confluence_get_content_tree`（および`confluence_get_space_overview`）は、node objectの羅列ではなくインデント済みテキストを返します。1行 = 1 node、インデント = 階層、末尾の`/` = folder、`[id]`は後続呼び出し用のcontent idです。`parentId`や`childPosition`は階層から復元できるためcompact outputには含めません。
+
+- `compact`（default）: output budgetに収まる最も深い表示を返します。収まらない場合はbranchを切り捨てる前にdepthを下げるため、branchは一覧から消えません。
+- `outline`: 直下の子だけを子数付きで返す「地図」。内部ではdepth 2のdescendantsを1回読むだけで、branchごとのAPI呼び出しは発生しません。巨大・未知の階層はまずこれを取り、必要なbranchだけ`compact`で展開します。
+- `detailed`: 従来どおりのnode object。`parentId` / `childPosition` / `status`が必要なときだけ使います。
+
+### Fetched / rendered / omitted と truncation
+
+`status`はMCPが取得した量とClaudeへ返した量を分けて報告します。
+
+- `fetchedItems` / `renderedItems` / `omittedItems`: 取得数、実際にrenderした数、省略された数
+- `truncated` と `truncationReasons`: `output_budget`（renderで省略）、`max_items`、`pagination_limit`、`api_error`
+- `omittedBranches`: 省略したbranchの`id` / `title` / `type` / `fetchedDescendants`。関係のありそうなbranchだけ`root_id`に指定して追加取得できます
+- `outputBudget`: `requestedChars`（指定値）、`effectiveChars`（実際に使われた値）、`hardCapChars`（サーバー上限50,000）
+
+`max_chars`は1,000〜50,000の範囲にクランプされます。指定値と実効値が異なる場合も`status.outputBudget`で確認できます。
+
+### Search mode
+
+`confluence_search_and_fetch`はCQLを書かずに`query`を渡せます。`search_mode`は`auto`（default）で、`title = "..."`（完全一致）→ `title ~ "...*"`（前方一致）→ `text ~ "..."`（全文）の順に試し、最初にhitした時点で止まります。full-text検索はtokenizeされるため、識別子や型番のように正確なtitleが分かっている場合はこの順序が有効です。`exact_title` / `title_prefix` / `full_text`で固定でき、`cql`は手書きクエリ用のescape hatchです。実際に使われたCQLは`strategy.cqlUsed`に入ります。
 
 ## Tool overview
 
@@ -116,11 +137,11 @@ High-level Toolには depth、max_items、max_items_per_section、fetch_top、ma
 | `confluence_delete_page`                                                | opt-inでtrash / purge                                       |
 | `confluence_raw_request`                                                | allowlisted pathだけの未ラップAPIアクセス                   |
 
-典型的な流れは、Space全体の把握には confluence_get_space_overview、CQL結果の本文確認には confluence_search_and_fetch、ページ理解には confluence_get_page_context、階層取得には confluence_get_content_tree を使い、単一階層だけ必要なときだけ confluence_list_children などのPrimitiveを使う形です。
+典型的な流れは、Space全体の把握には confluence_get_space_overview、ページ検索と本文確認には confluence_search_and_fetch、ページ理解には confluence_get_page_context、階層取得には confluence_get_content_tree（大きい場合はまず output_mode=outline）を使い、1階層だけ必要なときや cursor を自分で制御したいときだけ confluence_list_children などのPrimitiveを使う形です。
 
 ## Pagination and response size
 
-Primitiveのv2一覧系APIはConfluenceのcursor paginationに合わせ、レスポンスの next_cursor を返します。High-level Toolは、指定budgetに達するまでcursorをMCP内部で消費します。v1 CQL searchは start と next_start を使い、confluence_search_and_fetch は指定した fetch_top だけを本文取得します。
+Primitiveのv2一覧系APIはConfluenceのcursor paginationに合わせ、レスポンスの next_cursor を返します。High-level Toolは、指定budgetに達するまでcursorをMCP内部で消費します。v1 CQL searchは start と next_start を使い、confluence_search_and_fetch は指定した fetch_top だけを本文取得します。 High-level Toolのcursor消費には内部上限（1呼び出しあたり最大20ページ）があり、打ち切った場合は status.truncationReasons に pagination_limit が入ります。
 
 Tool responseはデフォルトで12,000文字に抑え、`max_chars`で最大50,000文字まで調整できます。ページ本文など大きい値は縮約されるため、必要な本文representationを指定して個別取得してください。
 

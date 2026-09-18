@@ -3,7 +3,8 @@ import { z } from 'zod';
 import type { ConfluenceClient } from '../client/confluence-client.js';
 import { extractNextCursor } from '../client/confluence-client.js';
 import { publicErrorMessage } from '../client/errors.js';
-import { toolResult } from './response.js';
+import { resolveOutputBudget, toolResult } from './response.js';
+import type { OutputBudget } from './response.js';
 
 type JsonRecord = Record<string, unknown>;
 type ClientResponse = { data: unknown; headers: Headers };
@@ -24,6 +25,11 @@ const MAX_SEARCH_FETCH = 20;
 const DEFAULT_FETCH_CONCURRENCY = 3;
 const MAX_FETCH_CONCURRENCY = 5;
 const MAX_PAGINATION_PAGES = 20;
+const OUTLINE_FETCH_ITEMS = 600;
+const OUTLINE_DEPTH = 2;
+const MAX_OMITTED_BRANCHES = 40;
+// Share of the output budget spent on the rendered tree, leaving room for status and hints.
+const TREE_TEXT_BUDGET_RATIO = 0.7;
 const THREAD_CHILD_CONCURRENCY = 4;
 const MAX_THREAD_API_CALLS = 60;
 
@@ -136,6 +142,172 @@ export function reconstructContentTree(
   return { root: rootNode, warnings };
 }
 
+export type TreeOutputMode = 'compact' | 'outline' | 'detailed';
+
+export interface OmittedBranch {
+  id: string;
+  title?: string | undefined;
+  type?: string | undefined;
+  /** Descendants already fetched below this branch; a floor, not a Confluence-wide count. */
+  fetchedDescendants: number;
+}
+
+export interface TreeRender {
+  text: string;
+  renderedItems: number;
+  renderedDepth: number;
+  omittedBranches: OmittedBranch[];
+  branchesNotListed: number;
+  budgetExceeded: boolean;
+}
+
+function treeDepth(node: ContentTreeNode): number {
+  return node.children.length === 0
+    ? 0
+    : 1 + Math.max(...node.children.map((child) => treeDepth(child)));
+}
+
+function countDescendants(node: ContentTreeNode): number {
+  let total = 0;
+  for (const child of node.children) total += 1 + countDescendants(child);
+  return total;
+}
+
+// One line per node: title, a folder marker, the id needed for follow-up calls, and nothing that
+// the indentation already encodes (parentId, depth, childPosition stay out of compact output).
+function nodeLine(node: ContentTreeNode, indent: number, bullet: boolean): string {
+  const title = node.title ?? '(untitled)';
+  const folder = node.type === 'folder' ? '/' : '';
+  const status = node.status && node.status !== 'current' ? ` <${node.status}>` : '';
+  return `${'  '.repeat(indent)}${bullet ? '- ' : ''}${title}${folder}${status} [${node.id}]`;
+}
+
+function omittedBranch(node: ContentTreeNode): OmittedBranch {
+  return {
+    id: node.id,
+    title: node.title,
+    type: node.type,
+    fetchedDescendants: countDescendants(node),
+  };
+}
+
+function renderAtDepth(
+  root: ContentTreeNode,
+  maxDepth: number,
+): { lines: string[]; renderedItems: number; omittedBranches: OmittedBranch[] } {
+  const lines: string[] = [];
+  const omittedBranches: OmittedBranch[] = [];
+  let renderedItems = 0;
+  const walk = (node: ContentTreeNode, depth: number): void => {
+    lines.push(nodeLine(node, depth, depth > 0));
+    if (depth > 0) renderedItems += 1;
+    if (node.children.length === 0) return;
+    if (depth >= maxDepth) {
+      omittedBranches.push(omittedBranch(node));
+      return;
+    }
+    for (const child of node.children) walk(child, depth + 1);
+  };
+  walk(root, 0);
+  return { lines, renderedItems, omittedBranches };
+}
+
+/**
+ * Renders the deepest view of the tree that fits the output budget. Depth is reduced before any
+ * branch is dropped, so a wide tree keeps every branch visible and reports the collapsed ones
+ * instead of silently losing the tail of the list.
+ */
+export function renderCompactTree(root: ContentTreeNode, budgetChars: number): TreeRender {
+  const deepest = treeDepth(root);
+  for (let depth = deepest; depth >= 1; depth -= 1) {
+    const attempt = renderAtDepth(root, depth);
+    const text = attempt.lines.join('\n');
+    if (text.length > budgetChars) continue;
+    return {
+      text,
+      renderedItems: attempt.renderedItems,
+      renderedDepth: depth,
+      omittedBranches: attempt.omittedBranches.slice(0, MAX_OMITTED_BRANCHES),
+      branchesNotListed: Math.max(0, attempt.omittedBranches.length - MAX_OMITTED_BRANCHES),
+      budgetExceeded: false,
+    };
+  }
+  if (deepest === 0) {
+    return {
+      text: nodeLine(root, 0, false),
+      renderedItems: 0,
+      renderedDepth: 0,
+      omittedBranches: [],
+      branchesNotListed: 0,
+      budgetExceeded: false,
+    };
+  }
+
+  // Even one level does not fit: keep as many top-level branches as the budget allows and report
+  // the rest, so the caller can expand exactly the branch it cares about.
+  const lines = [nodeLine(root, 0, false)];
+  const omittedBranches: OmittedBranch[] = [];
+  let renderedItems = 0;
+  let used = lines[0]?.length ?? 0;
+  let dropping = false;
+  for (const child of root.children) {
+    const line = nodeLine(child, 1, true);
+    if (dropping || used + line.length + 1 > budgetChars) {
+      dropping = true;
+      omittedBranches.push(omittedBranch(child));
+      continue;
+    }
+    lines.push(line);
+    used += line.length + 1;
+    renderedItems += 1;
+    if (child.children.length > 0) omittedBranches.push(omittedBranch(child));
+  }
+  return {
+    text: lines.join('\n'),
+    renderedItems,
+    renderedDepth: 1,
+    omittedBranches: omittedBranches.slice(0, MAX_OMITTED_BRANCHES),
+    branchesNotListed: Math.max(0, omittedBranches.length - MAX_OMITTED_BRANCHES),
+    budgetExceeded: true,
+  };
+}
+
+/**
+ * Outline view: one line per direct child with whether it has children and how many were seen.
+ * Built from a single depth-2 descendants read, so it never costs a per-branch request.
+ */
+export function renderOutline(
+  root: ContentTreeNode,
+  countsAreFloor: boolean,
+  budgetChars: number,
+): TreeRender {
+  const lines = [nodeLine(root, 0, false)];
+  const omittedBranches: OmittedBranch[] = [];
+  let renderedItems = 0;
+  let used = lines[0]?.length ?? 0;
+  for (const child of root.children) {
+    const count = child.children.length;
+    const marker =
+      count === 0 ? ' (no children seen)' : ` (${count}${countsAreFloor ? '+' : ''} children)`;
+    const line = `${nodeLine(child, 1, true)}${marker}`;
+    if (omittedBranches.length > 0 || used + line.length + 1 > budgetChars) {
+      omittedBranches.push(omittedBranch(child));
+      continue;
+    }
+    lines.push(line);
+    used += line.length + 1;
+    renderedItems += 1;
+  }
+  return {
+    text: lines.join('\n'),
+    renderedItems,
+    renderedDepth: 1,
+    omittedBranches: omittedBranches.slice(0, MAX_OMITTED_BRANCHES),
+    branchesNotListed: Math.max(0, omittedBranches.length - MAX_OMITTED_BRANCHES),
+    budgetExceeded: omittedBranches.length > 0,
+  };
+}
+
 export interface CursorCollection<T> {
   items: T[];
   pagesFetched: number;
@@ -143,6 +315,7 @@ export interface CursorCollection<T> {
   nextCursor?: string | undefined;
   paginationExhausted: boolean;
   truncated: boolean;
+  stopReason: 'complete' | 'max_items' | 'pagination_limit' | 'api_error';
   errors: string[];
 }
 
@@ -156,9 +329,13 @@ export async function collectCursorPages<T>(
   let cursor: string | undefined;
   let pagesFetched = 0;
   let nextCursor: string | undefined;
+  let stopReason: CursorCollection<T>['stopReason'] = 'complete';
 
   while (items.length < maxItems) {
-    if (pagesFetched >= MAX_PAGINATION_PAGES) break;
+    if (pagesFetched >= MAX_PAGINATION_PAGES) {
+      stopReason = 'pagination_limit';
+      break;
+    }
     try {
       const response = await request(cursor, Math.min(250, maxItems - items.length));
       pagesFetched += 1;
@@ -173,18 +350,20 @@ export async function collectCursorPages<T>(
       cursor = nextCursor;
     } catch (error) {
       errors.push(publicErrorMessage(error));
+      stopReason = 'api_error';
       break;
     }
   }
 
-  const truncated = Boolean(nextCursor);
+  if (stopReason === 'complete' && nextCursor) stopReason = 'max_items';
   return {
     items,
     pagesFetched,
     apiCalls: pagesFetched,
     nextCursor,
     paginationExhausted: !nextCursor && errors.length === 0,
-    truncated,
+    truncated: Boolean(nextCursor),
+    stopReason,
     errors,
   };
 }
@@ -214,12 +393,28 @@ export interface ContentTreeOptions {
   rootType: 'page' | 'folder';
   depth: number;
   maxItems: number;
+  outputMode: TreeOutputMode;
+  budget: OutputBudget;
+}
+
+function paginationReason(stopReason: CursorCollection<unknown>['stopReason']): string | undefined {
+  if (stopReason === 'max_items') return 'max_items';
+  if (stopReason === 'pagination_limit') return 'pagination_limit';
+  if (stopReason === 'api_error') return 'api_error';
+  return undefined;
 }
 
 export async function fetchContentTree(
   client: ConfluenceClient,
   options: ContentTreeOptions,
 ): Promise<JsonRecord> {
+  const outline = options.outputMode === 'outline';
+  // Retrieval budget and output budget are separate: outline reads wide but renders one level.
+  const fetchDepth = outline ? OUTLINE_DEPTH : options.depth;
+  const fetchMaxItems = outline
+    ? Math.min(TREE_MAX_ITEMS, Math.max(options.maxItems, OUTLINE_FETCH_ITEMS))
+    : options.maxItems;
+
   const rootRequest = client.requestJson<unknown>(
     'GET',
     contentPath(options.rootType, options.rootId),
@@ -229,20 +424,16 @@ export async function fetchContentTree(
       client.requestJson<unknown>(
         'GET',
         contentPath(options.rootType, options.rootId, '/descendants'),
-        {
-          depth: options.depth,
-          cursor,
-          limit,
-        },
+        { depth: fetchDepth, cursor, limit },
       ),
-    options.maxItems,
+    fetchMaxItems,
   );
   const [rootResult, descendantResult] = await Promise.allSettled([rootRequest, descendants]);
 
   const errors: string[] = [];
   const rootData = rootResult.status === 'fulfilled' ? rootResult.value.data : undefined;
   if (rootResult.status === 'rejected') errors.push(publicErrorMessage(rootResult.reason));
-  const pageData =
+  const pageData: CursorCollection<unknown> =
     descendantResult.status === 'fulfilled'
       ? descendantResult.value
       : {
@@ -251,6 +442,7 @@ export async function fetchContentTree(
           apiCalls: 0,
           paginationExhausted: false,
           truncated: false,
+          stopReason: 'api_error',
           errors: [publicErrorMessage(descendantResult.reason)],
         };
   errors.push(...pageData.errors);
@@ -260,20 +452,65 @@ export async function fetchContentTree(
     pageData.items,
   );
   errors.push(...build.warnings);
-  return {
-    root: build.root,
+
+  const fetchedItems = pageData.items.length;
+  const textBudget = Math.max(
+    500,
+    Math.floor(options.budget.effectiveChars * TREE_TEXT_BUDGET_RATIO),
+  );
+  const render =
+    options.outputMode === 'detailed'
+      ? undefined
+      : outline
+        ? renderOutline(build.root, pageData.truncated, textBudget)
+        : renderCompactTree(build.root, textBudget);
+
+  const renderedItems = render ? render.renderedItems : fetchedItems;
+  const truncationReasons = new Set<string>();
+  const retrievalReason = paginationReason(pageData.stopReason);
+  if (retrievalReason) truncationReasons.add(retrievalReason);
+  if (rootResult.status === 'rejected' || build.warnings.length > 0)
+    truncationReasons.add('api_error');
+  // Outline renders one level on purpose, so only a dropped branch counts as a budget loss.
+  if (outline ? render?.budgetExceeded : renderedItems < fetchedItems)
+    truncationReasons.add('output_budget');
+
+  const omittedBranches = render?.omittedBranches ?? [];
+  const output: JsonRecord = {
+    root: { id: build.root.id, title: build.root.title, type: build.root.type },
     status: {
-      partial: errors.length > 0,
-      truncated: pageData.truncated,
-      depthLimited: options.depth < TREE_MAX_DEPTH,
+      mode: options.outputMode,
+      depthRequested: outline ? OUTLINE_DEPTH : options.depth,
+      renderedDepth: render?.renderedDepth,
+      fetchedItems,
+      renderedItems,
+      omittedItems: Math.max(0, fetchedItems - renderedItems),
+      truncated: truncationReasons.size > 0,
+      truncationReasons: truncationReasons.size > 0 ? [...truncationReasons] : undefined,
       paginationExhausted: pageData.paginationExhausted,
       nextCursor: pageData.nextCursor,
-      itemsReturned: pageData.items.length,
-      pagesFetched: pageData.pagesFetched,
       apiCalls: pageData.apiCalls + 1,
+      outputBudget: options.budget,
       errors: errors.length > 0 ? errors : undefined,
     },
   };
+  if (render) {
+    output.tree = render.text;
+    output.legend =
+      'One line per node, indentation = hierarchy, "/" = folder, [id] = content id for follow-up calls.';
+  } else {
+    output.treeNodes = build.root;
+  }
+  if (omittedBranches.length > 0) {
+    output.omittedBranches = omittedBranches;
+    output.nextStep =
+      'Expand only the branches you need: call confluence_get_content_tree with root_id set to an omitted branch id.';
+  } else if (outline) {
+    output.nextStep =
+      'Pick the branches that matter and call confluence_get_content_tree with root_id set to their ids.';
+  }
+  if (render?.branchesNotListed) output.omittedBranchesNotListed = render.branchesNotListed;
+  return output;
 }
 
 function compactSearchResult(value: unknown): JsonRecord {
@@ -363,24 +600,87 @@ async function fetchPage(
     : truncatePageBody(response.data, maxCharsPerPage);
 }
 
+export type SearchMode = 'auto' | 'exact_title' | 'title_prefix' | 'full_text' | 'cql';
+
+function escapeCqlLiteral(value: string): string {
+  return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+}
+
+/**
+ * Builds the CQL for a plain query. Only operators Confluence documents for these fields are
+ * used: title supports = and ~ (with a trailing * wildcard), text supports ~ only.
+ */
+export function buildSearchCql(mode: Exclude<SearchMode, 'auto' | 'cql'>, query: string): string {
+  const value = escapeCqlLiteral(query.trim());
+  if (mode === 'exact_title') return `title = "${value}"`;
+  if (mode === 'title_prefix') return `title ~ "${value.replace(/\*+$/, '')}*"`;
+  return `text ~ "${value}"`;
+}
+
+// auto widens step by step and stops at the first hit, so an exact identifier is not diluted by
+// full-text tokenization while an unknown phrase still reaches full text.
+const AUTO_SEARCH_SEQUENCE: Array<Exclude<SearchMode, 'auto' | 'cql'>> = [
+  'exact_title',
+  'title_prefix',
+  'full_text',
+];
+
+export interface SearchAttempt {
+  mode: string;
+  cql: string;
+  size: number;
+}
+
+export function searchPlan(args: {
+  mode: SearchMode;
+  query?: string | undefined;
+  cql?: string | undefined;
+}): Array<{ mode: string; cql: string }> {
+  if (args.mode === 'cql' || (args.mode === 'auto' && !args.query && args.cql)) {
+    if (!args.cql) throw new Error('search_mode "cql" requires cql');
+    return [{ mode: 'cql', cql: args.cql }];
+  }
+  if (!args.query) throw new Error('Provide query, or cql with search_mode "cql"');
+  if (args.mode === 'auto')
+    return AUTO_SEARCH_SEQUENCE.map((mode) => ({ mode, cql: buildSearchCql(mode, args.query!) }));
+  return [{ mode: args.mode, cql: buildSearchCql(args.mode, args.query) }];
+}
+
 export async function searchAndFetch(
   client: ConfluenceClient,
   args: {
-    cql: string;
+    mode: SearchMode;
+    query?: string | undefined;
+    cql?: string | undefined;
     searchLimit: number;
     fetchTop: number;
     start: number;
     bodyFormat: string;
     maxCharsPerPage: number;
     fetchConcurrency: number;
+    budget: OutputBudget;
   },
 ): Promise<JsonRecord> {
-  const searchResponse = await client.requestJson<JsonRecord>('GET', '/wiki/rest/api/search', {
-    cql: args.cql,
+  const plan = searchPlan(args);
+  const attempts: SearchAttempt[] = [];
+  let searchResponse = await client.requestJson<JsonRecord>('GET', '/wiki/rest/api/search', {
+    cql: plan[0]!.cql,
     limit: args.searchLimit,
     start: args.start,
   });
-  const rawResults = resultItems<unknown>(searchResponse.data);
+  let rawResults = resultItems<unknown>(searchResponse.data);
+  attempts.push({ mode: plan[0]!.mode, cql: plan[0]!.cql, size: rawResults.length });
+  for (const step of plan.slice(1)) {
+    if (rawResults.length > 0) break;
+    searchResponse = await client.requestJson<JsonRecord>('GET', '/wiki/rest/api/search', {
+      cql: step.cql,
+      limit: args.searchLimit,
+      start: args.start,
+    });
+    rawResults = resultItems<unknown>(searchResponse.data);
+    attempts.push({ mode: step.mode, cql: step.cql, size: rawResults.length });
+  }
+  const used = attempts[attempts.length - 1]!;
   const selected = rawResults.slice(0, args.fetchTop);
   const fetched = await mapWithConcurrency(selected, args.fetchConcurrency, async (item) => {
     const searchResult = compactSearchResult(item);
@@ -410,10 +710,16 @@ export async function searchAndFetch(
           ? args.start + rawResults.length
           : undefined,
     },
+    strategy: {
+      searchMode: used.mode,
+      cqlUsed: used.cql,
+      attempts: attempts.length > 1 ? attempts : undefined,
+    },
     status: {
       partial: fetched.some((item) => !item.fetched),
-      searchApiCalls: 1,
+      searchApiCalls: attempts.length,
       pageApiCalls: fetched.filter((item) => item.fetched).length,
+      outputBudget: args.budget,
       note: 'Search metadata and fetched page bodies are paired by result order and id.',
     },
   };
@@ -448,6 +754,7 @@ export async function getPageContext(
     includeComments: boolean;
     commentTypes: Array<'footer' | 'inline'>;
     maxItemsPerSection: number;
+    budget: OutputBudget;
   },
 ): Promise<JsonRecord> {
   const tasks: Promise<JsonRecord>[] = [
@@ -496,7 +803,10 @@ export async function getPageContext(
   }
   const sections = await Promise.all(tasks);
   const errors = sections.filter((section) => section.ok === false).map((section) => section.error);
-  const output: JsonRecord = { sections, status: { partial: errors.length > 0, errors } };
+  const output: JsonRecord = {
+    sections,
+    status: { partial: errors.length > 0, outputBudget: args.budget, errors },
+  };
   return output;
 }
 
@@ -533,6 +843,8 @@ export async function getSpaceOverview(
     rootType: 'page' | 'folder';
     depth: number;
     maxItems: number;
+    outputMode: TreeOutputMode;
+    budget: OutputBudget;
   },
 ): Promise<JsonRecord> {
   let spaceId = args.spaceId;
@@ -571,6 +883,8 @@ export async function getSpaceOverview(
     rootType: args.rootType,
     depth: args.depth,
     maxItems: args.maxItems,
+    outputMode: args.outputMode,
+    budget: args.budget,
   });
   return {
     space: spaceResult,
@@ -589,6 +903,7 @@ export async function getCommentThread(
     bodyFormat: string;
     maxDepth: number;
     maxItems: number;
+    budget: OutputBudget;
   },
 ): Promise<JsonRecord> {
   const suffix = args.commentType === 'footer' ? 'footer-comments' : 'inline-comments';
@@ -656,6 +971,7 @@ export async function getCommentThread(
       maxDepth: args.maxDepth,
       itemsReturned: itemCount,
       apiCalls,
+      outputBudget: args.budget,
       errors: errors.length > 0 ? errors : undefined,
     },
   };
@@ -679,25 +995,29 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
     'confluence_get_content_tree',
     {
       description:
-        'HIGH-LEVEL: Get a page or folder subtree in one MCP call. Prefer this over recursively calling confluence_list_children; the server uses v2 descendants, consumes cursor pagination, reconstructs parentId/depth/childPosition, and returns explicit budget/truncation status.',
+        'HIGH-LEVEL: Get a page or folder hierarchy in one MCP call, rendered as an indented text tree (title [id], a trailing / marks folders). Prefer this over recursively calling confluence_list_children: the server reads v2 descendants, consumes cursor pagination, and rebuilds the hierarchy. output_mode=compact (default) returns the deepest view that fits the output budget and lists collapsed branches in omittedBranches, so a follow-up call can expand only what matters; output_mode=outline returns just the direct children with child counts and is the cheapest way to map a large or unknown tree first; output_mode=detailed returns raw node objects and is only worth it when parentId, childPosition or status are needed. status separates fetchedItems from renderedItems and names every truncationReason.',
       inputSchema: z.object({
         root_id: z.string().min(1),
         root_type: z.enum(['page', 'folder']).default('page'),
+        output_mode: z.enum(['compact', 'outline', 'detailed']).default('compact'),
         depth: z.number().int().min(0).max(TREE_MAX_DEPTH).default(DEFAULT_TREE_DEPTH),
         max_items: z.number().int().min(1).max(TREE_MAX_ITEMS).default(DEFAULT_TREE_ITEMS),
         max_chars: maxChars,
       }),
     },
-    highLevelError(async ({ root_id, root_type, depth, max_items, max_chars: chars }) =>
-      toolResult(
-        await fetchContentTree(client, {
-          rootId: root_id,
-          rootType: root_type,
-          depth,
-          maxItems: max_items,
-        }),
-        chars,
-      ),
+    highLevelError(
+      async ({ root_id, root_type, output_mode, depth, max_items, max_chars: chars }) =>
+        toolResult(
+          await fetchContentTree(client, {
+            rootId: root_id,
+            rootType: root_type,
+            depth,
+            maxItems: max_items,
+            outputMode: output_mode,
+            budget: resolveOutputBudget(chars),
+          }),
+          chars,
+        ),
     ),
   );
 
@@ -705,9 +1025,13 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
     'confluence_search_and_fetch',
     {
       description:
-        'HIGH-LEVEL: Search with CQL and fetch the top matching page bodies in one MCP call. Prefer this over confluence_search followed by confluence_get_page for each result. Results retain paired search metadata and page content; non-page or failed fetches are reported as partial results.',
+        'HIGH-LEVEL: Find pages and read their bodies in one MCP call. Prefer this over confluence_search followed by confluence_get_page per result. Pass a plain query with search_mode instead of writing CQL: auto (default) tries exact title, then title prefix, then full text and stops at the first mode that matches, which keeps identifiers such as codes or part numbers from being diluted by full-text tokenization; exact_title, title_prefix and full_text pin one strategy; cql is the escape hatch for a hand-written query. strategy.cqlUsed reports what actually ran. Non-page or failed fetches come back as partial results.',
       inputSchema: z.object({
-        cql: z.string().min(1).max(4_000),
+        query: z.string().min(1).max(500).optional(),
+        search_mode: z
+          .enum(['auto', 'exact_title', 'title_prefix', 'full_text', 'cql'])
+          .default('auto'),
+        cql: z.string().min(1).max(4_000).optional(),
         search_limit: z.number().int().min(1).max(100).default(25),
         fetch_top: z.number().int().min(0).max(MAX_SEARCH_FETCH).default(DEFAULT_SEARCH_FETCH),
         start: z.number().int().min(0).default(0),
@@ -724,6 +1048,8 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
     },
     highLevelError(
       async ({
+        query,
+        search_mode,
         cql,
         search_limit,
         fetch_top,
@@ -735,7 +1061,10 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
       }) =>
         toolResult(
           await searchAndFetch(client, {
+            mode: search_mode,
+            query,
             cql,
+            budget: resolveOutputBudget(chars),
             searchLimit: search_limit,
             fetchTop: fetch_top,
             start,
@@ -793,6 +1122,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
             includeComments: include_comments,
             commentTypes: comment_types,
             maxItemsPerSection: max_items_per_section,
+            budget: resolveOutputBudget(chars),
           }),
           chars,
         ),
@@ -809,13 +1139,23 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
         space_key: z.string().min(1).optional(),
         root_id: z.string().optional(),
         root_type: z.enum(['page', 'folder']).default('page'),
+        output_mode: z.enum(['compact', 'outline', 'detailed']).default('compact'),
         depth: z.number().int().min(0).max(TREE_MAX_DEPTH).default(DEFAULT_TREE_DEPTH),
         max_items: z.number().int().min(1).max(TREE_MAX_ITEMS).default(DEFAULT_TREE_ITEMS),
         max_chars: maxChars,
       }),
     },
     highLevelError(
-      async ({ space_id, space_key, root_id, root_type, depth, max_items, max_chars: chars }) =>
+      async ({
+        space_id,
+        space_key,
+        root_id,
+        root_type,
+        output_mode,
+        depth,
+        max_items,
+        max_chars: chars,
+      }) =>
         toolResult(
           await getSpaceOverview(client, {
             spaceId: space_id,
@@ -824,6 +1164,8 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
             rootType: root_type,
             depth,
             maxItems: max_items,
+            outputMode: output_mode,
+            budget: resolveOutputBudget(chars),
           }),
           chars,
         ),
@@ -853,6 +1195,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
             bodyFormat: body_format,
             maxDepth: max_depth,
             maxItems: max_items,
+            budget: resolveOutputBudget(chars),
           }),
           chars,
         ),

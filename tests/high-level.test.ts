@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ConfluenceClient } from '../src/client/confluence-client.js';
+import { resolveOutputBudget } from '../src/tools/response.js';
 import {
   collectCursorPages,
   getCommentThread,
@@ -67,7 +68,9 @@ describe('high-level combined reads', () => {
     });
 
     const result = await searchAndFetch(client, {
+      mode: 'cql',
       cql: 'type=page',
+      budget: resolveOutputBudget(),
       searchLimit: 10,
       fetchTop: 2,
       start: 0,
@@ -98,6 +101,7 @@ describe('high-level combined reads', () => {
       includeComments: false,
       commentTypes: ['footer'],
       maxItemsPerSection: 10,
+      budget: resolveOutputBudget(),
     });
 
     expect(result.status).toMatchObject({ partial: true });
@@ -123,6 +127,7 @@ describe('high-level traversal budgets', () => {
       bodyFormat: 'storage',
       maxDepth: 2,
       maxItems: 50,
+      budget: resolveOutputBudget(),
     });
 
     const root = result.root as { replies?: Array<{ id: string; replies?: unknown[] }> };
@@ -146,11 +151,13 @@ describe('high-level traversal budgets', () => {
       rootType: 'page',
       depth: 2,
       maxItems: 100,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(),
     });
 
     expect(result.spaceId).toBe('900');
-    const tree = result.tree as { root: { children: Array<{ id: string }> } };
-    expect(tree.root.children.map((child) => child.id)).toEqual(['6']);
+    const tree = result.tree as { tree: string };
+    expect(tree.tree).toContain('Child [6]');
     expect(client.requestJson).toHaveBeenCalledTimes(4);
   });
 });

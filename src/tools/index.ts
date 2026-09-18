@@ -96,7 +96,7 @@ export function registerConfluenceTools(
     'confluence_search',
     {
       description:
-        'Primitive: search Confluence content with CQL when only compact search metadata is needed. For search plus page bodies in one call, prefer confluence_search_and_fetch.',
+        'Primitive: search Confluence content with raw CQL when only compact search metadata is needed, or when the query needs fields the high-level tool does not expose (label, space, type, ancestor, lastmodified). For search plus page bodies, and for plain queries that should not be hand-written as CQL, prefer confluence_search_and_fetch. CQL matching: title = "Exact Title" matches the whole title; title ~ "Prefix*" matches a partial title; text ~ "words" searches full text. Full text is tokenized, so an identifier such as AB12-C also matches pages containing only its fragments: when the exact title is known, try title = first, then title ~ "...*", and use text ~ only as the fallback. Combine with and/or, for example space = "DOCS" and title ~ "Report*".',
       inputSchema: z.object({
         cql: z.string().min(1).max(4_000),
         limit: z.number().int().min(1).max(100).default(25),
@@ -196,7 +196,7 @@ export function registerConfluenceTools(
     'confluence_get_page',
     {
       description:
-        'Primitive: get one Confluence page by ID. For a page understanding bundle with ancestors, attachments, or comments, prefer confluence_get_page_context.',
+        'Primitive: get one Confluence page by ID. Use it when a single page body or a specific field set is all that is needed. For the page plus its ancestors, attachments, or comments, prefer confluence_get_page_context.',
       inputSchema: z.object({
         page_id: z.string().min(1),
         body_format: bodyFormat,
@@ -308,7 +308,7 @@ export function registerConfluenceTools(
     'confluence_get_space',
     {
       description:
-        'Primitive: get one Confluence space by ID. When first understanding a space and its structure, prefer confluence_get_space_overview.',
+        'Primitive: get one Confluence space by ID when only the space record is needed. When first understanding a space and its structure, prefer confluence_get_space_overview, which also accepts a space key.',
       inputSchema: z.object({
         space_id: z.string().min(1),
         description_format: z.string().optional(),
@@ -410,7 +410,7 @@ export function registerConfluenceTools(
     'confluence_list_children',
     {
       description:
-        'Primitive: list one direct level of page or folder children. For a subtree, prefer confluence_get_content_tree so the server handles descendants pagination and reconstruction in one MCP call.',
+        'Primitive: list one direct level of page or folder children. Use it when exactly one immediate level is needed, or when the caller wants to drive cursor pagination itself. For recursive hierarchy exploration prefer confluence_get_content_tree; for a large or unknown hierarchy call it with output_mode=outline first and expand only the branches that matter.',
       inputSchema: z.object({
         parent_id: z.string().min(1),
         parent_type: z.enum(['page', 'folder']).default('page'),
@@ -440,7 +440,7 @@ export function registerConfluenceTools(
     'confluence_list_descendants',
     {
       description:
-        'Primitive: list one paginated descendants response below a page or folder. For a complete bounded tree with parent/child nesting, prefer confluence_get_content_tree.',
+        'Primitive: list one paginated descendants response below a page or folder, in flat top-to-bottom order. Use it when a raw page of descendants or manual cursor control is needed. For a rendered hierarchy with pagination handled server-side, prefer confluence_get_content_tree.',
       inputSchema: z.object({
         parent_id: z.string().min(1),
         parent_type: z.enum(['page', 'folder']).default('page'),
