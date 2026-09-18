@@ -7,7 +7,7 @@ import type { ConfluenceClient } from '../client/confluence-client.js';
 import { extractNextCursor } from '../client/confluence-client.js';
 import { publicErrorMessage } from '../client/errors.js';
 import { toolResult } from './response.js';
-import { registerHighLevelTools } from './high-level.js';
+import { registerHighLevelTools, versionHistoryFilter } from './high-level.js';
 
 const bodyFormat = z
   .enum(['storage', 'atlas_doc_format', 'view', 'export_view', 'styled_view'])
@@ -440,18 +440,27 @@ export function registerConfluenceTools(
     'confluence_list_descendants',
     {
       description:
-        'Primitive: list one paginated descendants response below a page or folder, in flat top-to-bottom order. Use it when a raw page of descendants or manual cursor control is needed. For a rendered hierarchy with pagination handled server-side, prefer confluence_get_content_tree.',
+        'Primitive: list one paginated descendants response below a page or folder, in flat top-to-bottom order. Returns the API response as-is, including the "Versions of ..." containers Confluence uses for retained document versions; set include_version_history=false to drop those and everything under them from this page of results. Use it when a raw page of descendants or manual cursor control is needed. For a rendered hierarchy with pagination handled server-side, and with version history excluded by default, prefer confluence_get_content_tree.',
       inputSchema: z.object({
         parent_id: z.string().min(1),
         parent_type: z.enum(['page', 'folder']).default('page'),
         depth: z.number().int().min(1).max(100).optional(),
+        include_version_history: z.boolean().default(true),
         cursor: z.string().optional(),
         limit,
         max_chars,
       }),
     },
     withError(
-      async ({ parent_id, parent_type, depth, cursor, limit: resultLimit, max_chars: chars }) => {
+      async ({
+        parent_id,
+        parent_type,
+        depth,
+        include_version_history,
+        cursor,
+        limit: resultLimit,
+        max_chars: chars,
+      }) => {
         const path =
           parent_type === 'page'
             ? `/wiki/api/v2/pages/${id(parent_id)}/descendants`
@@ -461,7 +470,27 @@ export function registerConfluenceTools(
           cursor,
           limit: resultLimit,
         });
-        return toolResult({ data: response.data, next_cursor: nextPage(response) }, chars);
+        if (include_version_history)
+          return toolResult({ data: response.data, next_cursor: nextPage(response) }, chars);
+        // Filtering one page cannot see containers opened on an earlier page; the high-level tree
+        // tool applies the same rule across the whole traversal.
+        const filter = versionHistoryFilter();
+        const record =
+          response.data && typeof response.data === 'object'
+            ? (response.data as Record<string, unknown>)
+            : {};
+        const results = Array.isArray(record.results) ? record.results : [];
+        return toolResult(
+          {
+            data: { ...record, results: results.filter((item) => filter.keep(item)) },
+            excluded_version_history: {
+              containers: filter.excludedRoots,
+              items: filter.excludedItems,
+            },
+            next_cursor: nextPage(response),
+          },
+          chars,
+        );
       },
     ),
   );

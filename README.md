@@ -109,6 +109,14 @@ High-level Toolを通常優先してください。サーバー内部でpaginati
 
 `truncationReasons`に`output_budget`が入っている場合、**取得済み（`fetchedItems`）のうちrenderできなかった分**なので、`max_chars`を上げるだけで追加のAPI呼び出しなしに表示を増やせます。compact renderは残り予算で折り畳んだbranchを可能な限り展開するため、予算を上げた分はそのまま表示ノード数に反映されます。
 
+### 版履歴（Versions of ...）の除外
+
+Confluenceは保持された版を通常の子コンテンツ（`Versions of ...` フォルダとその配下の版ページ）として持つため、無指定のdescendants取得では版履歴だけでitem budgetを使い切り、兄弟branchに到達できないことがあります。
+
+`confluence_get_content_tree` と `confluence_get_space_overview` は既定でこれらを除外します（`include_version_history: true` で含められます）。除外はpagination中に行われるため、**除外されたnodeは `max_items` を消費しません**。除外量は `status.excludedVersionHistory`（`containers` / `items`）で報告するので、黙って消えることはありません。
+
+Primitiveの `confluence_list_descendants` はAPIの応答をそのまま返す既定（`include_version_history: true`）のままで、`false` を指定するとそのページ分だけ同じ規則で除外します（前ページで開いたcontainerは判定できません）。
+
 ### 続きの取得（cursor）
 
 `status.nextCursor`が返った場合は、同じ`root_id` / `depth` / `output_mode`のまま`cursor`に渡すと続きから取得できます（`confluence_get_content_tree`、`confluence_get_space_overview`）。継続ページでは親が前ページに含まれるnodeが出るため、それらはrootの直下に並べ、件数を`status.unresolvedParents`で報告します（エラー扱いにはしません）。`status.cursorUsed`には実際に使ったcursorが入ります。

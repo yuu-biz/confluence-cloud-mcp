@@ -1,16 +1,26 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ConfluenceClient } from '../src/client/confluence-client.js';
-import { fetchContentTree, searchAndFetch, searchPlan } from '../src/tools/high-level.js';
+import {
+  fetchContentTree,
+  getCommentThread,
+  searchAndFetch,
+  searchPlan,
+  versionHistoryFilter,
+} from '../src/tools/high-level.js';
 import { boundedJson, resolveOutputBudget } from '../src/tools/response.js';
 import {
   DEEP_BRANCH_INDEXES,
   FIXTURE_BRANCH_COUNT,
   FIXTURE_ROOT_ID,
-  descendantsWithinDepth,
+  VERSION_CONTAINER_ID,
+  VERSION_HISTORY_ITEMS,
   midSizeTreeDescendants,
+  treeWithVersionHistory,
 } from './fixtures/tree.js';
 
-function treeClient(options: { pageSize?: number; depthFilter?: boolean } = {}) {
+function treeClient(
+  options: { pageSize?: number; depthFilter?: boolean; withVersions?: boolean } = {},
+) {
   const pageSize = options.pageSize ?? 1_000;
   const calls: Array<{ path: string; query?: Record<string, unknown> }> = [];
   const client = {
@@ -23,8 +33,9 @@ function treeClient(options: { pageSize?: number; depthFilter?: boolean } = {}) 
         };
       }
       const depth = Number(query?.depth ?? 8);
+      const source = options.withVersions ? treeWithVersionHistory() : midSizeTreeDescendants();
       const all =
-        options.depthFilter === false ? midSizeTreeDescendants() : descendantsWithinDepth(depth);
+        options.depthFilter === false ? source : source.filter((item) => item.depth <= depth);
       const offset = Number(query?.cursor ?? 0);
       const slice = all.slice(offset, offset + pageSize);
       const nextOffset = offset + slice.length;
@@ -43,6 +54,7 @@ const treeArgs = {
   rootType: 'page' as const,
   depth: 5,
   maxItems: 1_000,
+  includeVersionHistory: false,
 };
 
 describe('compact content tree', () => {
@@ -258,6 +270,105 @@ describe('compact content tree', () => {
       effectiveChars: 50_000,
       hardCapChars: 50_000,
     });
+  });
+});
+
+describe('version history', () => {
+  it('drops version containers and their subtrees by default', async () => {
+    const { client } = treeClient({ withVersions: true });
+    const result = await fetchContentTree(client, {
+      ...treeArgs,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(50_000),
+    });
+
+    const tree = result.tree as string;
+    const status = result.status as Record<string, unknown>;
+    expect(tree).not.toContain('Versions of');
+    expect(tree).not.toContain(VERSION_CONTAINER_ID);
+    expect(tree).not.toContain('Section 1 [');
+    expect(status.excludedVersionHistory).toEqual({
+      containers: 1,
+      items: VERSION_HISTORY_ITEMS + 1,
+    });
+    // Excluded nodes do not count against the item budget.
+    expect(status.fetchedItems).toBe(midSizeTreeDescendants().length);
+  });
+
+  it('keeps sibling branches reachable when one branch is buried in history', async () => {
+    const { client } = treeClient({ withVersions: true });
+    const withHistory = await fetchContentTree(client, {
+      ...treeArgs,
+      maxItems: 60,
+      includeVersionHistory: true,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(50_000),
+    });
+    const filtered = await fetchContentTree(client, {
+      ...treeArgs,
+      maxItems: 60,
+      outputMode: 'compact',
+      budget: resolveOutputBudget(50_000),
+    });
+
+    const historyTree = withHistory.tree as string;
+    const filteredTree = filtered.tree as string;
+    const branchesIn = (tree: string): number =>
+      Array.from({ length: FIXTURE_BRANCH_COUNT }).filter((_, index) =>
+        tree.includes(`[b${index}]`),
+      ).length;
+    expect(historyTree).toContain('Versions of Alpha Page 1');
+    expect(branchesIn(filteredTree)).toBeGreaterThan(branchesIn(historyTree));
+  });
+
+  it('excludes a whole container subtree even across pages', () => {
+    const filter = versionHistoryFilter();
+    const stream = [
+      { id: 'doc', title: 'Doc', parentId: 'root' },
+      { id: 'versions', title: 'Versions of Doc', parentId: 'doc' },
+      { id: 'v1', title: 'Doc v1', parentId: 'versions' },
+      { id: 'v1-s1', title: 'Doc v1 Section 1', parentId: 'v1' },
+      { id: 'other', title: 'Other Doc', parentId: 'root' },
+    ];
+    expect(stream.filter((item) => filter.keep(item)).map((item) => item.id)).toEqual([
+      'doc',
+      'other',
+    ]);
+    expect(filter.excludedRoots).toBe(1);
+    expect(filter.excludedItems).toBe(3);
+  });
+});
+
+describe('comment threads', () => {
+  it('bounds a wide thread by max_items and reports the truncation', async () => {
+    const replies = Array.from({ length: 40 }, (_, index) => ({ id: `r${index}` }));
+    const client = {
+      requestJson: vi.fn(async (_method: string, path: string) => {
+        if (path.endsWith('/children')) {
+          return {
+            data: { results: path.includes('/root/') ? replies : [] },
+            headers: new Headers(),
+          };
+        }
+        return { data: { id: 'root', title: 'Thread root' }, headers: new Headers() };
+      }),
+    } as unknown as ConfluenceClient;
+
+    const result = await getCommentThread(client, {
+      commentId: 'root',
+      commentType: 'footer',
+      bodyFormat: 'storage',
+      maxDepth: 3,
+      maxItems: 10,
+      budget: resolveOutputBudget(),
+    });
+
+    const status = result.status as Record<string, unknown>;
+    expect(status.itemsReturned).toBe(10);
+    expect(status.truncated).toBe(true);
+    // The call budget is respected rather than one request per reply.
+    expect(status.apiCalls as number).toBeLessThanOrEqual(60);
+    expect(status.outputBudget).toMatchObject({ effectiveChars: 12_000 });
   });
 });
 

@@ -79,3 +79,53 @@ export function midSizeTreeDescendants(): DescendantFixture[] {
 export function descendantsWithinDepth(depth: number): DescendantFixture[] {
   return midSizeTreeDescendants().filter((item) => item.depth <= depth);
 }
+
+export const VERSION_CONTAINER_ID = 'b0-c0-versions';
+/** Version pages held under one container, each with its own section pages. */
+export const VERSION_HISTORY_ITEMS = 12 * 4;
+
+/**
+ * The same space with retained document versions attached to the first branch, the shape that
+ * pushed real sibling branches out of a single descendants read.
+ */
+export function treeWithVersionHistory(): DescendantFixture[] {
+  const items = midSizeTreeDescendants();
+  const anchor = items.findIndex((item) => item.id === 'b0-c0');
+  const history: DescendantFixture[] = [
+    {
+      id: VERSION_CONTAINER_ID,
+      title: 'Versions of Alpha Page 1',
+      type: 'folder',
+      status: 'current',
+      parentId: 'b0-c0',
+      depth: 3,
+      childPosition: 99,
+    },
+  ];
+  for (let version = 0; version < 12; version += 1) {
+    const versionId = `${VERSION_CONTAINER_ID}-v${version}`;
+    history.push({
+      id: versionId,
+      title: `Alpha Page 1 v${version + 1}`,
+      type: 'page',
+      status: 'current',
+      parentId: VERSION_CONTAINER_ID,
+      depth: 4,
+      childPosition: version,
+    });
+    for (let section = 0; section < 3; section += 1) {
+      history.push({
+        id: `${versionId}-s${section}`,
+        title: `Alpha Page 1 v${version + 1} Section ${section + 1}`,
+        type: 'page',
+        status: 'current',
+        parentId: versionId,
+        depth: 5,
+        childPosition: section,
+      });
+    }
+  }
+  // Inserted where Confluence would return it: inside the first branch, before later branches.
+  items.splice(anchor + 1, 0, ...history);
+  return items;
+}

@@ -49,6 +49,51 @@ function resultItems<T>(data: unknown): T[] {
   return Array.isArray(record?.results) ? (record.results as T[]) : [];
 }
 
+// Confluence exposes retained document versions as ordinary child content ("Versions of X"
+// folders holding a page per version), so an unfiltered descendants read can spend its whole
+// budget on history and never reach the sibling branches.
+const VERSION_HISTORY_TITLE = /^\s*(versions? of|version history)\b/i;
+
+export function isVersionHistoryTitle(title: unknown): boolean {
+  return typeof title === 'string' && VERSION_HISTORY_TITLE.test(title);
+}
+
+export interface VersionHistoryFilter {
+  keep: (item: unknown) => boolean;
+  excludedRoots: number;
+  excludedItems: number;
+}
+
+/**
+ * Stateful filter over a flat, top-to-bottom descendants stream: drops nodes whose title marks a
+ * version-history container, and everything below them.
+ */
+export function versionHistoryFilter(): VersionHistoryFilter {
+  const excludedIds = new Set<string>();
+  const filter: VersionHistoryFilter = {
+    excludedRoots: 0,
+    excludedItems: 0,
+    keep: (item: unknown): boolean => {
+      const record = asRecord(item);
+      const itemId = stringValue(record?.id);
+      const parentId = stringValue(record?.parentId);
+      if (parentId && excludedIds.has(parentId)) {
+        if (itemId) excludedIds.add(itemId);
+        filter.excludedItems += 1;
+        return false;
+      }
+      if (isVersionHistoryTitle(record?.title)) {
+        if (itemId) excludedIds.add(itemId);
+        filter.excludedRoots += 1;
+        filter.excludedItems += 1;
+        return false;
+      }
+      return true;
+    },
+  };
+  return filter;
+}
+
 function compactContentItem(value: unknown, fallbackDepth = 1): ContentTreeItem | undefined {
   const record = asRecord(value);
   const itemId = stringValue(record?.id);
@@ -389,6 +434,7 @@ export async function collectCursorPages<T>(
   request: (cursor: string | undefined, limit: number) => Promise<ClientResponse>,
   maxItems: number,
   startCursor?: string,
+  keep?: (item: T) => boolean,
 ): Promise<CursorCollection<T>> {
   const items: T[] = [];
   const errors: string[] = [];
@@ -406,7 +452,9 @@ export async function collectCursorPages<T>(
     try {
       const response = await request(cursor, Math.min(250, maxItems - items.length));
       pagesFetched += 1;
-      const pageItems = resultItems<T>(response.data);
+      const pageItems = keep
+        ? resultItems<T>(response.data).filter(keep)
+        : resultItems<T>(response.data);
       items.push(...pageItems.slice(0, maxItems - items.length));
       nextCursor = extractNextCursor(response.data, response.headers);
       if (!nextCursor || seenCursors.has(nextCursor)) {
@@ -464,6 +512,7 @@ export interface ContentTreeOptions {
   budget: OutputBudget;
   /** status.nextCursor from a previous call, to continue the same traversal. */
   cursor?: string | undefined;
+  includeVersionHistory: boolean;
 }
 
 function paginationReason(stopReason: CursorCollection<unknown>['stopReason']): string | undefined {
@@ -484,6 +533,7 @@ export async function fetchContentTree(
     ? Math.min(TREE_MAX_ITEMS, Math.max(options.maxItems, OUTLINE_FETCH_ITEMS))
     : options.maxItems;
 
+  const versionFilter = options.includeVersionHistory ? undefined : versionHistoryFilter();
   const rootRequest = client.requestJson<unknown>(
     'GET',
     contentPath(options.rootType, options.rootId),
@@ -497,6 +547,7 @@ export async function fetchContentTree(
       ),
     fetchMaxItems,
     options.cursor,
+    versionFilter?.keep,
   );
   const [rootResult, descendantResult] = await Promise.allSettled([rootRequest, descendants]);
 
@@ -561,6 +612,9 @@ export async function fetchContentTree(
       paginationExhausted: pageData.paginationExhausted,
       cursorUsed: options.cursor,
       nextCursor: pageData.nextCursor,
+      excludedVersionHistory: versionFilter?.excludedItems
+        ? { containers: versionFilter.excludedRoots, items: versionFilter.excludedItems }
+        : undefined,
       unresolvedParents: build.unresolvedParents.length || undefined,
       apiCalls: pageData.apiCalls + 1,
       outputBudget: options.budget,
@@ -941,6 +995,7 @@ export async function getSpaceOverview(
     outputMode: TreeOutputMode;
     budget: OutputBudget;
     cursor?: string | undefined;
+    includeVersionHistory: boolean;
   },
 ): Promise<JsonRecord> {
   let spaceId = args.spaceId;
@@ -982,6 +1037,7 @@ export async function getSpaceOverview(
     outputMode: args.outputMode,
     budget: args.budget,
     cursor: args.cursor,
+    includeVersionHistory: args.includeVersionHistory,
   });
   return {
     space: spaceResult,
@@ -1092,19 +1148,29 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
     'confluence_get_content_tree',
     {
       description:
-        'HIGH-LEVEL: Get a page or folder hierarchy in one MCP call, rendered as an indented text tree (title [id], a trailing / marks folders). Prefer this over recursively calling confluence_list_children: the server reads v2 descendants, consumes cursor pagination, and rebuilds the hierarchy. output_mode=compact (default) returns the deepest view that fits the output budget and lists collapsed branches in omittedBranches, so a follow-up call can expand only what matters; output_mode=outline returns just the direct children with child counts and is the cheapest way to map a large or unknown tree first; output_mode=detailed returns raw node objects and is only worth it when parentId, childPosition or status are needed. status separates fetchedItems from renderedItems and names every truncationReason. When status.nextCursor is returned, pass it back as cursor with the same root_id, depth and output_mode to continue the traversal; when truncationReasons contains output_budget, raising max_chars renders more of what was already fetched without extra API calls.',
+        'HIGH-LEVEL: Get a page or folder hierarchy in one MCP call, rendered as an indented text tree (title [id], a trailing / marks folders). Prefer this over recursively calling confluence_list_children: the server reads v2 descendants, consumes cursor pagination, and rebuilds the hierarchy. output_mode=compact (default) returns the deepest view that fits the output budget and lists collapsed branches in omittedBranches, so a follow-up call can expand only what matters; output_mode=outline returns just the direct children with child counts and is the cheapest way to map a large or unknown tree first; output_mode=detailed returns raw node objects and is only worth it when parentId, childPosition or status are needed. Retained document versions, which Confluence stores as "Versions of ..." child content, are excluded by default so history cannot consume the item budget ahead of sibling branches; set include_version_history=true to include them, and status.excludedVersionHistory reports what was skipped. status separates fetchedItems from renderedItems and names every truncationReason. When status.nextCursor is returned, pass it back as cursor with the same root_id, depth and output_mode to continue the traversal; when truncationReasons contains output_budget, raising max_chars renders more of what was already fetched without extra API calls.',
       inputSchema: z.object({
         root_id: z.string().min(1),
         root_type: z.enum(['page', 'folder']).default('page'),
         output_mode: z.enum(['compact', 'outline', 'detailed']).default('compact'),
         depth: z.number().int().min(0).max(TREE_MAX_DEPTH).default(DEFAULT_TREE_DEPTH),
         max_items: z.number().int().min(1).max(TREE_MAX_ITEMS).default(DEFAULT_TREE_ITEMS),
+        include_version_history: z.boolean().default(false),
         cursor: z.string().optional(),
         max_chars: maxChars,
       }),
     },
     highLevelError(
-      async ({ root_id, root_type, output_mode, depth, max_items, cursor, max_chars: chars }) =>
+      async ({
+        root_id,
+        root_type,
+        output_mode,
+        depth,
+        max_items,
+        include_version_history,
+        cursor,
+        max_chars: chars,
+      }) =>
         toolResult(
           await fetchContentTree(client, {
             rootId: root_id,
@@ -1114,6 +1180,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
             outputMode: output_mode,
             budget: resolveOutputBudget(chars),
             cursor,
+            includeVersionHistory: include_version_history,
           }),
           chars,
         ),
@@ -1241,6 +1308,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
         output_mode: z.enum(['compact', 'outline', 'detailed']).default('compact'),
         depth: z.number().int().min(0).max(TREE_MAX_DEPTH).default(DEFAULT_TREE_DEPTH),
         max_items: z.number().int().min(1).max(TREE_MAX_ITEMS).default(DEFAULT_TREE_ITEMS),
+        include_version_history: z.boolean().default(false),
         cursor: z.string().optional(),
         max_chars: maxChars,
       }),
@@ -1254,6 +1322,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
         output_mode,
         depth,
         max_items,
+        include_version_history,
         cursor,
         max_chars: chars,
       }) =>
@@ -1268,6 +1337,7 @@ export function registerHighLevelTools(server: McpServer, client: ConfluenceClie
             outputMode: output_mode,
             budget: resolveOutputBudget(chars),
             cursor,
+            includeVersionHistory: include_version_history,
           }),
           chars,
         ),
